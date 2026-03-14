@@ -30,21 +30,21 @@
 
 #define COLOR_BLACK nvgRGBA(0, 0, 0, 255)
 #define COLOR_BLACK_ALPHA(x) nvgRGBA(0, 0, 0, x)
-#define COLOR_WHITE nvgRGBA(255, 255, 255, 255)
+#define COLOR_WHITE nvgRGBA(255, 255, 255, 150)
 #define COLOR_WHITE_ALPHA(x) nvgRGBA(255, 255, 255, x)
-#define COLOR_RED_ALPHA(x) nvgRGBA(255, 0, 0, x)
+#define COLOR_RED_ALPHA(x) nvgRGBA(255, 59, 59, x)
 #define COLOR_YELLOW nvgRGBA(218, 202, 37, 255)
 #define COLOR_YELLOW_ALPHA(x) nvgRGBA(218, 202, 37, x)
 //#define COLOR_RED nvgRGBA(201, 34, 49, 255)
-#define COLOR_RED nvgRGBA(255, 0, 0, 255)
+#define COLOR_RED nvgRGBA(255, 59, 59, 255)
 #define COLOR_OCHRE nvgRGBA(218, 111, 37, 255)
 #define COLOR_OCHRE_ALPHA(x) nvgRGBA(218, 111, 37, x)
-#define COLOR_GREEN nvgRGBA(0, 203, 0, 255)
-#define COLOR_GREEN_ALPHA(x) nvgRGBA(0, 153, 0, x)
-#define COLOR_BLUE nvgRGBA(0, 0, 255, 255)
-#define COLOR_BLUE_ALPHA(x) nvgRGBA(0, 0, 255, x)
-#define COLOR_ORANGE nvgRGBA(255, 175, 3, 255)
-#define COLOR_ORANGE_ALPHA(x) nvgRGBA(255, 175, 3, x)
+#define COLOR_GREEN nvgRGBA(0, 255, 148, 255)
+#define COLOR_GREEN_ALPHA(x) nvgRGBA(0, 255, 148, x)
+#define COLOR_BLUE nvgRGBA(0, 122, 255, 255)
+#define COLOR_BLUE_ALPHA(x) nvgRGBA(0, 122, 255, x)
+#define COLOR_ORANGE nvgRGBA(255, 149, 0, 255)
+#define COLOR_ORANGE_ALPHA(x) nvgRGBA(255, 149, 0, x)
 #define COLOR_GREY nvgRGBA(191, 191, 191, 1)
 #define COLOR_GREY_ALPHA(x) nvgRGBA(191, 191, 191, x)
 
@@ -1391,8 +1391,8 @@ public:
     void draw(const UIState* s) {
         if (!make_data(s)) return;
 
-        NVGcolor color = nvgRGBA(255, 215, 0, 150);
-        NVGcolor color2 = nvgRGBA(0, 204, 0, 150);
+        NVGcolor color = nvgRGBA(255, 59, 59, 150);
+        NVGcolor color2 = nvgRGBA(255, 59, 59, 150);
 
         SubMaster& sm = *(s->sm);
         auto car_state = sm["carState"].getCarState();
@@ -1427,6 +1427,7 @@ public:
         }
     }
 };
+
 
 class PathDrawer : ModelDrawer {
 private:
@@ -1708,7 +1709,7 @@ public:
             COLOR_WHITE_ALPHA(alpha),         COLOR_BLACK_ALPHA(alpha),
         };
 
-        bool brake_valid = car_state.getBrakeLights();
+        bool brake_valid = false; // car_state.getBrakeLights(); 
         const auto radar_state = sm["radarState"].getRadarState();
         auto lead_one = radar_state.getLeadOne();
         auto lp = sm["longitudinalPlan"].getLongitudinalPlan();
@@ -1717,15 +1718,15 @@ public:
 
         if (show_path_color >= 20) {
           if (longActive) {
-            show_path_color = 13;// green
+            show_path_color = 3;// green
             if (lead_one.getStatus()) {
-              if (abs(accel) < 0.5f) show_path_color = 12; // yellow
-              else if (accel >= 0.5f) show_path_color = 11; // amber
-              else show_path_color = 10; // red
+              if (abs(accel) < 0.5f) show_path_color = 2; // yellow
+              else if (accel >= 0.5f) show_path_color = 2; // yellow로 수정
+              else show_path_color = 0; // red
             }
           }
           else {
-            show_path_color = 19; // black
+            show_path_color = 9; // black
           }
         }
 

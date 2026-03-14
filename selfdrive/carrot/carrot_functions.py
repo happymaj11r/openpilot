@@ -1,4 +1,5 @@
 from enum import Enum
+import os 
 
 from cereal import log
 from openpilot.common.params import Params
@@ -46,6 +47,10 @@ class CarrotPlanner:
     self.params = Params()
     self.params_count = 0
     self.frame = 0
+
+    # [추가] 새로운 앞차 1회성 알림을 위한 상태 변수
+    self.lead_alerted = False
+    self.lead_lost_count = 0
 
     #self.log = ""
 
@@ -453,9 +458,27 @@ class CarrotPlanner:
 
     self.fakeCruiseDistance = 0.0
     lead_detected = radarstate.leadOne.status # & radarstate.leadOne.radar
+    is_cruising = carstate.cruiseState.enabled # 크루즈 작동 여부 확인
+
+    # [수정] 크루즈 작동 중 + 새로운 앞차에 대해 1회만 알림
+    if lead_detected:
+      self.lead_lost_count = 0
+      # 아직 이 앞차에 대해 알림을 울리지 않았다면
+      if not self.lead_alerted:
+        # 크루즈가 켜져 있고 & 내 차가 감속 중일 때 딱 한 번 알림!
+        if is_cruising and a_ego < -0.2:
+          open("/dev/shm/carrot_lead_braking", "w").close()
+          self.lead_alerted = True  # 알림을 줬다고 도장을 찍음 (이 차가 사라질 때까지 반복 안 함)
+    else:
+      # 앞차를 완전히 놓쳤을 때 (레이더 깜빡임 방지를 위해 약 1초 대기 후 초기화)
+      self.lead_lost_count += 1
+      if self.lead_lost_count > 20:
+        self.lead_alerted = False
 
     self.xStop = self.update_stop_dist(x[31])
+
     stop_model_x_raw = self.xStop
+
     if self._stop_x_rl is None:
       self._stop_x_rl = stop_model_x_raw
     else:

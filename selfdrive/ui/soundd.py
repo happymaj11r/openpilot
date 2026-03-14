@@ -2,6 +2,7 @@ import math
 import numpy as np
 import time
 import wave
+import os
 
 
 from cereal import car, messaging
@@ -40,8 +41,9 @@ sound_list: dict[int, tuple[str, int | None, float]] = {
   AudibleAlert.warningSoft: ("warning_soft.wav", None, MAX_VOLUME),
   AudibleAlert.warningImmediate: ("warning_immediate.wav", None, MAX_VOLUME),
 
-  AudibleAlert.longEngaged: ("tici_engaged.wav", None, MAX_VOLUME),
+  AudibleAlert.longEngaged: ("tici_engaged.wav", 1, MAX_VOLUME),
   AudibleAlert.longDisengaged: ("tici_disengaged.wav", None, MAX_VOLUME),
+
   AudibleAlert.trafficSignGreen: ("traffic_sign_green.wav", None, MAX_VOLUME),
   AudibleAlert.trafficSignChanged: ("traffic_sign_changed.wav", None, MAX_VOLUME),
   AudibleAlert.trafficError: ("audio_traffic_error.wav", None, MAX_VOLUME),
@@ -206,8 +208,16 @@ class Soundd:
     if sm.updated['selfdriveState']:
       new_alert = sm['selfdriveState'].alertSound.raw
       new_alert = self.update_carrot_alert(sm, new_alert)
+
+      # ✅ [새로운 안전한 코드] 에러가 안 나는 메모리 스위치 방식으로 교체합니다.
+      if os.path.exists("/dev/shm/carrot_lead_braking"):
+        os.remove("/dev/shm/carrot_lead_braking")
+        new_alert = AudibleAlert.longEngaged
+
       self.update_alert(new_alert)
     elif check_selfdrive_timeout_alert(sm):
+
+
       self.update_alert(AudibleAlert.warningImmediate)
       self.selfdrive_timeout_alert = True
     elif self.selfdrive_timeout_alert:

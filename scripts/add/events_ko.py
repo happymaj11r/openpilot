@@ -566,7 +566,7 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   },
 
   EventName.laneChangeBlocked: {
-    ET.WARNING: Alert(
+    ET.PERMANENT: Alert(
       "사각지대에 차량이 감지되니 대기하세요",
       "",
       AlertStatus.userPrompt, AlertSize.small,
@@ -574,15 +574,15 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   },
 
   EventName.laneChange: {
-    ET.WARNING: Alert(
+    ET.PERMANENT: Alert(
       "차선을 변경합니다",
       "",
       AlertStatus.normal, AlertSize.small,
-      Priority.LOW, VisualAlert.none, AudibleAlert.none, .1),
+      Priority.LOW, VisualAlert.none, AudibleAlert.longDisengaged, 3.),
   },
 
   EventName.steerSaturated: {
-    ET.WARNING: Alert(
+    ET.PERMANENT: Alert(
       "핸들을 잡아주세요",
       "회전이 조향 한도를 초과함",
       AlertStatus.userPrompt, AlertSize.mid,
@@ -1009,7 +1009,7 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
      ET.WARNING: EngagementAlert(AudibleAlert.audioTurn),
   },
   EventName.trafficSignGreen: {
-    ET.WARNING: EngagementAlert(AudibleAlert.trafficSignGreen),
+    ET.PERMANENT: EngagementAlert(AudibleAlert.trafficSignGreen),
     #ET.WARNING: Alert(
     #  "출발합니다.",
     #  "",
@@ -1017,11 +1017,7 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
     #  Priority.LOW, VisualAlert.none, AudibleAlert.trafficSignGreen, 3.),
   },
   EventName.trafficSignChanged: {
-    ET.WARNING: Alert(
-      "신호가바뀌었어요.",
-      "",
-      AlertStatus.normal, AlertSize.small,
-      Priority.LOW, VisualAlert.none, AudibleAlert.trafficSignChanged, 1.),
+    ET.PERMANENT: EngagementAlert(AudibleAlert.trafficSignChanged),
   },
   EventName.turningLeft: {
     ET.WARNING: Alert(
