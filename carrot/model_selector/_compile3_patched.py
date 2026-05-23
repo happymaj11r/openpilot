@@ -23,28 +23,32 @@ import runpy
 import sys
 
 
+# PatternMatcher 콜백은 closure 를 가질 수 없다(tinygrad/uop/ops.py
+# `deconstruct_function`). 따라서 _unwrap_end_store 는 module-level 로 두고
+# 필요한 심볼은 함수 내부에서 import 한다 (함수 locals 는 closure 가 아님).
+def _unwrap_end_store(after):
+  from tinygrad.uop.ops import Ops
+  new_deps = []
+  changed = False
+  for s in after.src[1:]:
+    if s.op is Ops.END and len(s.src) and s.src[0].op is Ops.STORE:
+      new_deps.append(s.src[0])
+      changed = True
+    else:
+      new_deps.append(s)
+  if not changed:
+    return None
+  return after.replace(src=(after.src[0], *new_deps))
+
+
 def _apply_patch() -> None:
   from tinygrad.engine import schedule as _sched
-  from tinygrad.uop.ops import Ops, UOp, graph_rewrite, PatternMatcher, UPat
+  from tinygrad.uop.ops import Ops, graph_rewrite, PatternMatcher, UPat
 
   original_create_schedule = _sched.create_schedule
-
-  def _unwrap_end_store(after: UOp):
-    new_deps = []
-    changed = False
-    for s in after.src[1:]:
-      if s.op is Ops.END and len(s.src) and s.src[0].op is Ops.STORE:
-        new_deps.append(s.src[0])
-        changed = True
-      else:
-        new_deps.append(s)
-    if not changed:
-      return None
-    return after.replace(src=(after.src[0], *new_deps))
-
   pm = PatternMatcher([(UPat(Ops.AFTER, name='after'), _unwrap_end_store)])
 
-  def create_schedule_patched(sched_sink: UOp) -> UOp:
+  def create_schedule_patched(sched_sink):
     return original_create_schedule(graph_rewrite(sched_sink, pm, name="end_store_unwrap"))
 
   _sched.create_schedule = create_schedule_patched
