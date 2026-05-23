@@ -118,21 +118,13 @@ assert IMG_QUEUE_SHAPE[0] == 30
 
 
 def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action,
-                          lat_action_t: float, long_action_t: float, v_ego: float, lat_smooth_seconds: float, vEgoStopping: float,
-                          has_action_t_input: bool = False) -> log.ModelDataV2.Action:
+                          lat_action_t: float, long_action_t: float, v_ego: float, lat_smooth_seconds: float, vEgoStopping: float) -> log.ModelDataV2.Action:
     # op11: on_policy가 (curv_unscaled, accel)을 직접 산출.
     # plan 기반 산출이 불가능한 경우 폴백.
     if 'action' in model_output:
-      # op_model16_deep PR(a2f8fc9a) 라인: action[0]은 curv*v_ego², action[1]은 accel.
-      # 시그니처는 action_t 입력 존재로 식별 (해당 PR에서 action_t 입력과 함께 도입됨).
-      # action_t가 없는 변형 모델은 기존 /100.0 고정 스케일링 유지(레거시 호환).
-      if has_action_t_input:
-        desired_curvature = float(model_output['action'][0, 0]) / (max(1.0, v_ego))**2
-        desired_accel = float(model_output['action'][0, 1])
-      else:
-        desired_curv_unscaled, desired_accel = model_output['action'][0]
-        desired_curvature = float(desired_curv_unscaled) / 100.0
-        desired_accel = float(desired_accel)
+      desired_curv_unscaled, desired_accel = model_output['action'][0]
+      desired_curvature = float(desired_curv_unscaled) / 100.0
+      desired_accel = float(desired_accel)
       should_stop = (v_ego < 0.3 and desired_accel < 0.1)
 
       desired_accel = smooth_value(desired_accel, prev_action.desiredAcceleration, LONG_SMOOTH_SECONDS)
@@ -280,11 +272,7 @@ class ModelState:
 
     # policy inputs
     self.numpy_inputs = {k: np.zeros(self.policy_input_shapes[k], dtype=np.float32) for k in self.policy_input_shapes}
-    # op_model16_deep PR(a2f8fc9a) 라인 식별: action_t 입력을 받는 on_policy는
-    # (curv*v_ego², accel) 스케일 규약을 따른다. get_action_from_model에서 분기에 사용.
-    self.has_action_t_input = 'action_t' in self.numpy_inputs
     cloudlog.info(f"carrot_modeld: desire key = {self.desire_key}")
-    cloudlog.info(f"carrot_modeld: has_action_t_input = {self.has_action_t_input}")
     self.full_input_queues = InputQueues(ModelConstants.MODEL_CONTEXT_FREQ, ModelConstants.MODEL_RUN_FREQ, ModelConstants.N_FRAMES)
     for k in [self.desire_key, 'features_buffer']:
       self.full_input_queues.update_dtypes_and_shapes({k: self.numpy_inputs[k].dtype}, {k: self.numpy_inputs[k].shape})
@@ -598,8 +586,7 @@ def main(demo=False):
       drivingdata_send = messaging.new_message('drivingModelData')
       posenet_send = messaging.new_message('cameraOdometry')
 
-      action = get_action_from_model(model_output, prev_action, lat_action_t, long_action_t, v_ego, lat_smooth_seconds, vEgoStopping,
-                                     has_action_t_input=model.has_action_t_input)
+      action = get_action_from_model(model_output, prev_action, lat_action_t, long_action_t, v_ego, lat_smooth_seconds, vEgoStopping)
       prev_action = action
       fill_model_msg(drivingdata_send, modelv2_send, model_output, action,
                      publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,

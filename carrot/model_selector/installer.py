@@ -34,8 +34,6 @@ from .config import (
 
 METADATA_SCRIPT = OPENPILOT_ROOT / "selfdrive" / "modeld" / "get_model_metadata.py"
 COMPILE3_SCRIPT = OPENPILOT_ROOT / "tinygrad_repo" / "examples" / "openpilot" / "compile3.py"
-# tinygrad 409bb0+ 의 END(STORE) wrap 회피 패치를 적용한 후 compile3.py 를 실행한다.
-COMPILE3_WRAPPER = OPENPILOT_ROOT / "carrot" / "model_selector" / "_compile3_patched.py"
 COMPILE_WARP_SCRIPT = OPENPILOT_ROOT / "selfdrive" / "modeld" / "compile_warp.py"
 BUILTIN_MODELS_DIR = OPENPILOT_ROOT / "selfdrive" / "modeld" / "models"
 
@@ -84,7 +82,7 @@ def _compile_one(base: str, tmp_dir: Path, env: dict[str, str]) -> None:
     cloudlog.warning(f"model_selector: generating metadata for {base}")
     _run(["python3", str(METADATA_SCRIPT), str(onnx), str(meta)], env=env)
     cloudlog.warning(f"model_selector: compiling {base} with tinygrad")
-    _run(["python3", str(COMPILE3_WRAPPER), str(COMPILE3_SCRIPT), str(onnx), str(pkl)], env=env)
+    _run(["python3", str(COMPILE3_SCRIPT), str(onnx), str(pkl)], env=env)
 
 
 def _copy_warp_pkls(tmp_dir: Path) -> None:
