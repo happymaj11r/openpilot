@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import json
 import math
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -121,14 +122,20 @@ class ModelEntry:
         return sorted(self.files.keys())
 
 
-def _min_selector_version(raw: dict) -> int:
+def _min_selector_version(raw: dict) -> int | None:
+    """Entry's minimum selector version; None when unparseable.
+
+    Callers treat None as fail-closed (skip the entry): an entry whose
+    version requirement can't be read must not be shown to selectors it
+    might be incompatible with.
+    """
     min_ver = raw.get("minimum_selector_version")
     if min_ver is None:
         min_ver = raw.get("minimumSelectorVersion", 0)
     try:
         return int(min_ver)
     except (TypeError, ValueError):
-        return 0
+        return None
 
 
 def _parse_model(raw: dict) -> ModelEntry:
@@ -151,7 +158,7 @@ def _parse_model(raw: dict) -> ModelEntry:
         base_url=str(base_url),
         added_at=str(added_at),
         files=files,
-        minimum_selector_version=_min_selector_version(raw),
+        minimum_selector_version=_min_selector_version(raw) or 0,
         raw=raw,
     )
 
@@ -175,7 +182,7 @@ def _fetch_and_verify_one(url: str, timeout: float = 20.0) -> list[ModelEntry]:
 
     try:
         doc = json.loads(body)
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
         raise ManifestError(f"manifest is not valid JSON: {e}") from e
 
     if not isinstance(doc, dict):
@@ -211,7 +218,9 @@ def _fetch_and_verify_one(url: str, timeout: float = 20.0) -> list[ModelEntry]:
             continue
         # Version-gate BEFORE parsing: entries for newer selectors may use
         # filenames this version doesn't know, and must not fail the whole list.
-        if _min_selector_version(raw) > MODEL_SELECTOR_VERSION:
+        # Unreadable version requirement → fail closed (skip).
+        min_ver = _min_selector_version(raw)
+        if min_ver is None or min_ver > MODEL_SELECTOR_VERSION:
             continue
         try:
             entry = _parse_model(raw)
@@ -237,4 +246,9 @@ def fetch_and_verify(url: str | None = None, timeout: float = 20.0) -> list[Mode
             return _fetch_and_verify_one(u, timeout)
         except ManifestError as e:
             errors.append(e)
+            if len(urls) > 1:
+                # A quietly-degraded list (fallback after a broken primary)
+                # must at least be diagnosable from the web server log.
+                print(f"model_selector: manifest fetch failed for {u}: {e}",
+                      file=sys.stderr)
     raise errors[0]
