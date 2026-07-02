@@ -39,7 +39,7 @@ Carrot 파일럿 전용 주행 모델 다운로드/설치/적용 모듈. c3x·c4
 |------|------|
 | `config.py` | 경로·파일명 상수, 허용 onnx 목록 (supercombo 포함), tinygrad 컴파일 플래그 |
 | `keys.py` | Ed25519 공개키 맵 + `MODEL_SELECTOR_VERSION` (v4: supercombo 지원) |
-| `manifest.py` | `models.json` fetch (캐시버스터 `?t=unixtime` + no-cache 헤더) + canonical JSON Ed25519 검증. snake_case/camelCase 필드 둘 다 수용 |
+| `manifest.py` | `models_v4.json`(전체 카탈로그) fetch → 실패 시 `models.json`(레거시, 동결) 폴백. 캐시버스터 `?t=unixtime` + no-cache 헤더 + canonical JSON Ed25519 검증. 버전 게이트를 파일명 검사보다 먼저 수행하고 해석 불가 항목은 스킵(전방 호환). snake_case/camelCase 필드 둘 다 수용 |
 | `downloader.py` | ONNX 스트리밍 다운로드 + SHA256/크기 검증. 공백 포함 파일명 URL percent-encoding. supercombo 단독 또는 legacy 세트 허용 |
 | `validator.py` | `/data/models/` 파일 세트 유효성 검증 (`has_supercombo` / legacy 세트) + `describe()` 라벨 |
 | `installer.py` | 신형: `compile_modeld.py` 로 통합 pkl 생성. 구형: tinygrad 컴파일 (compile3) + warp pkl. 공통: atomic swap + 실패 시 backup 복원 |
@@ -123,6 +123,13 @@ describe=/data/models: vision+on_policy+off_policy
 
 ## 안전장치
 
+- **manifest 전방 호환 + 이중화** (`manifest.py`)
+  — 구버전(v3) 파서는 미지의 파일명이 manifest 항목 하나에라도 있으면 목록 전체가
+  죽는 결함이 있어(버전 게이트 이전에 파일명 검사), 원격 저장소는 `models.json`(레거시
+  파일명 전용, 동결) + `models_v4.json`(전체 카탈로그)으로 이중화됨. v4 파서는
+  버전 게이트를 파싱보다 먼저 수행하고 해석 불가 항목을 스킵하므로 이후 버전에서
+  새 파일명이 추가되어도 같은 사고가 재발하지 않음. 신형 파일명이 든 항목을
+  `models.json` 에 넣으면 안 됨 (openpilot-models 의 `update_models.py` 가 자동 분리).
 - **설치 전 metadata 검증** (`installer._validate_supercombo_metadata`)
   — 필수 입력(img/big_img/desire_pulse/traffic_convention/action_t/features_buffer),
   `hidden_state` output slice, 모델 입력 크기 512x256(MEDMODEL — 런타임 warp 행렬이 이 크기에 고정) 을
