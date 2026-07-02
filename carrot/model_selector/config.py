@@ -27,6 +27,7 @@ ALLOWED_ONNX_FILES = frozenset({
     "driving_policy.onnx",
     "driving_on_policy.onnx",
     "driving_off_policy.onnx",
+    "driving_supercombo.onnx",
 })
 
 # Base names that we compile (.onnx → _tinygrad.pkl + _metadata.pkl)
@@ -34,6 +35,16 @@ VISION_BASE = "driving_vision"
 ON_POLICY_BASE = "driving_on_policy"
 POLICY_BASE = "driving_policy"
 OFF_POLICY_BASE = "driving_off_policy"
+
+# New-architecture (lebowski) single-onnx model: compile_modeld.py bundles
+# metadata + model JIT + per-resolution warp JITs into one pkl that the
+# upstream modeld engine loads directly.
+SUPERCOMBO_BASE = "driving_supercombo"
+SUPERCOMBO_PKL_NAME = "driving_tinygrad.pkl"
+
+# Env var honored by selfdrive/modeld/helpers.py::modeld_pkl_path() to load
+# the unified pkl from a custom directory instead of the built-in models dir.
+MODELD_MODELS_DIR_ENV = "MODELD_MODELS_DIR"
 
 # Params keys
 PARAM_DRIVING_MODEL_NAME = "DrivingModelName"

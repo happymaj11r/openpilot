@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import pickle
+import platform
 import shutil
 import subprocess
 from pathlib import Path
@@ -28,6 +29,8 @@ from .config import (
     PARAM_DRIVING_MODEL_NAME,
     PARAM_PENDING_MODEL_NAME,
     POLICY_BASE,
+    SUPERCOMBO_BASE,
+    SUPERCOMBO_PKL_NAME,
     TINYGRAD_COMPILE_ENV_FALLBACK,
     TINYGRAD_COMPILE_ENV_QCOM,
     VISION_BASE,
@@ -36,6 +39,7 @@ from .config import (
 
 METADATA_SCRIPT = OPENPILOT_ROOT / "selfdrive" / "modeld" / "get_model_metadata.py"
 COMPILE3_SCRIPT = OPENPILOT_ROOT / "tinygrad_repo" / "examples" / "openpilot" / "compile3.py"
+COMPILE_MODELD_SCRIPT = OPENPILOT_ROOT / "selfdrive" / "modeld" / "compile_modeld.py"
 LEGACY_WARP_SCRIPT = OPENPILOT_ROOT / "carrot" / "model_selector" / "compile_legacy_warp.py"
 CAMERA_CONFIGS = (
     (_ar_ox_fisheye.width, _ar_ox_fisheye.height),  # tici: 1928x1208
@@ -47,9 +51,35 @@ class InstallError(Exception):
     pass
 
 
+def _probe_tg_devices() -> set[str]:
+    """Mirror SConscript's device probe (subprocess so device locks release)."""
+    try:
+        out = subprocess.run(
+            ["python3", "-c",
+             "from tinygrad import Device\nprint('\\n'.join(Device.get_available_devices()))"],
+            capture_output=True, text=True, check=True, timeout=120,
+            cwd=str(OPENPILOT_ROOT),
+        )
+        return set(out.stdout.strip().splitlines())
+    except Exception:
+        return set()
+
+
 def _tinygrad_env() -> dict[str, str]:
     env = os.environ.copy()
-    flags = TINYGRAD_COMPILE_ENV_QCOM if TICI else TINYGRAD_COMPILE_ENV_FALLBACK
+    if TICI:
+        flags = TINYGRAD_COMPILE_ENV_QCOM
+    else:
+        # Non-device (PC) compile: the runtime reads its tensor devices from the
+        # build-time tg_input_devices.json (CUDA when available), so the compile
+        # backend must match or the pickled JITs replay on the wrong device.
+        available = _probe_tg_devices()
+        if "CUDA" in available:
+            flags = {"DEV": "CUDA"}
+        elif platform.system() == "Darwin":
+            flags = {"DEV": "CPU"}
+        else:
+            flags = TINYGRAD_COMPILE_ENV_FALLBACK
     env.update(flags)
     return env
 
@@ -90,15 +120,101 @@ def _compile_one(base: str, tmp_dir: Path, env: dict[str, str]) -> None:
     _run(["python3", str(COMPILE3_SCRIPT), str(onnx), str(pkl)], env=env)
 
 
-def _model_input_size(tmp_dir: Path) -> tuple[int, int]:
-    metadata_path = tmp_dir / f"{VISION_BASE}_metadata.pkl"
+def _load_metadata(tmp_dir: Path, base: str) -> dict:
+    metadata_path = tmp_dir / f"{base}_metadata.pkl"
     with open(metadata_path, "rb") as f:
-        metadata = pickle.load(f)
+        return pickle.load(f)
+
+
+def _model_input_size(tmp_dir: Path, base: str = VISION_BASE) -> tuple[int, int]:
+    metadata = _load_metadata(tmp_dir, base)
     img_shape = metadata["input_shapes"].get("img")
     if img_shape is None or len(img_shape) != 4:
-        raise InstallError(f"cannot infer model input size from {metadata_path}: img={img_shape}")
+        raise InstallError(f"cannot infer model input size from {base} metadata: img={img_shape}")
     # img shape is (batch, channels, h/2, w/2) after NV12 packing.
     return int(img_shape[3]) * 2, int(img_shape[2]) * 2
+
+
+def _validate_supercombo_metadata(metadata: dict) -> None:
+    """Reject models the upstream runtime cannot run BEFORE installing them,
+    so an incompatible download fails cleanly instead of crash-looping modeld."""
+    from openpilot.common.transformations.model import MEDMODEL_INPUT_SIZE
+
+    input_shapes = metadata.get("input_shapes") or {}
+    required = {"img", "big_img", "desire_pulse", "traffic_convention", "action_t", "features_buffer"}
+    missing = sorted(required - input_shapes.keys())
+    if missing:
+        raise InstallError(f"supercombo model is missing required inputs: {missing}")
+
+    if tuple(input_shapes["img"]) != tuple(input_shapes["big_img"]):
+        raise InstallError(
+            f"img/big_img shape mismatch: {input_shapes['img']} vs {input_shapes['big_img']}"
+        )
+
+    # The runtime warp matrices (get_warp_matrix) are built from MEDMODEL
+    # 512x256 intrinsics; a model with a different input frame would silently
+    # get geometrically wrong camera inputs, so fail closed.
+    img_shape = input_shapes["img"]
+    model_size = (int(img_shape[3]) * 2, int(img_shape[2]) * 2)
+    if model_size != tuple(MEDMODEL_INPUT_SIZE):
+        raise InstallError(
+            f"supercombo input size {model_size} != supported {tuple(MEDMODEL_INPUT_SIZE)}"
+        )
+
+    output_slices = metadata.get("output_slices") or {}
+    if "hidden_state" not in output_slices:
+        raise InstallError("supercombo model has no 'hidden_state' output slice (required by runtime)")
+
+
+def _cleanup_stale_shm() -> None:
+    """compile_modeld.py copies the onnx to /dev/shm and cleans it via atexit,
+    which never runs if the compile is OOM-killed — drop leftovers first."""
+    try:
+        from openpilot.system.hardware.hw import Paths
+        for stale in Path(Paths.shm_path()).glob("compile_modeld_*"):
+            stale.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _compile_supercombo(tmp_dir: Path, env: dict[str, str]) -> None:
+    """Compile a new-architecture single-onnx model with the upstream
+    compile_modeld pipeline.  The resulting pkl bundles metadata, the model
+    JIT, and one warp JIT per camera resolution — the upstream modeld engine
+    loads it as-is (no separate metadata/warp pkls needed)."""
+    from openpilot.selfdrive.modeld.constants import ModelConstants
+
+    onnx = tmp_dir / f"{SUPERCOMBO_BASE}.onnx"
+    output = tmp_dir / SUPERCOMBO_PKL_NAME
+
+    # Metadata pkl is only needed here for validation and input-size
+    # derivation; the runtime reads metadata from inside the unified pkl.
+    cloudlog.warning(f"model_selector: generating metadata for {SUPERCOMBO_BASE}")
+    _run(["python3", str(METADATA_SCRIPT), str(onnx)], env=env)
+    metadata = _load_metadata(tmp_dir, SUPERCOMBO_BASE)
+    _validate_supercombo_metadata(metadata)
+    model_w, model_h = _model_input_size(tmp_dir, base=SUPERCOMBO_BASE)
+    _cleanup_stale_shm()
+
+    # Must match the runtime: modeld.py derives frame_skip from ModelConstants
+    # when building input queues, so the compiled JIT has to use the same value.
+    frame_skip = ModelConstants.MODEL_RUN_FREQ // ModelConstants.MODEL_CONTEXT_FREQ
+
+    cloudlog.warning(
+        f"model_selector: compiling {SUPERCOMBO_BASE} with compile_modeld "
+        f"(model {model_w}x{model_h}, frame_skip {frame_skip})"
+    )
+    cmd = [
+        "python3", str(COMPILE_MODELD_SCRIPT),
+        "--model-size", f"{model_w}x{model_h}",
+        "--camera-resolutions", *[f"{w}x{h}" for w, h in CAMERA_CONFIGS],
+        "--onnx", str(onnx),
+        "--output", str(output),
+        "--frame-skip", str(frame_skip),
+    ]
+    _run(cmd, env=env)
+    if not output.exists() or output.stat().st_size == 0:
+        raise InstallError(f"compile_modeld produced no output at {output}")
 
 
 def _compile_legacy_warp_pkls(tmp_dir: Path, env: dict[str, str]) -> None:
@@ -149,8 +265,9 @@ def compile_pending() -> None:
 
     Behaviour mirrors the c3-ms installer:
       * validate ONNX files in /data/models_tmp
-      * generate metadata.pkl + tinygrad.pkl for each model
-      * compile warp pkls
+      * new architecture: driving_supercombo.onnx → unified driving_tinygrad.pkl
+        (compile_modeld bundles metadata + model JIT + warp JITs)
+      * legacy: generate metadata.pkl + tinygrad.pkl per model + warp pkls
       * atomic swap tmp → /data/models
       * write DrivingModelName, clear PendingModelName
       * on any failure, wipe /data/models_tmp and restore backup
@@ -158,16 +275,23 @@ def compile_pending() -> None:
     if not MODELS_TMP_DIR.exists():
         return
 
+    params = Params()
+    model_name = params.get(PARAM_PENDING_MODEL_NAME)
+
+    supercombo = MODELS_TMP_DIR / f"{SUPERCOMBO_BASE}.onnx"
     vision = MODELS_TMP_DIR / f"{VISION_BASE}.onnx"
     on_policy = MODELS_TMP_DIR / f"{ON_POLICY_BASE}.onnx"
     policy = MODELS_TMP_DIR / f"{POLICY_BASE}.onnx"
-    if not vision.exists() or not (on_policy.exists() or policy.exists()):
+    has_legacy_set = vision.exists() and (on_policy.exists() or policy.exists())
+    if not supercombo.exists() and not has_legacy_set:
+        # A pending name without a complete file set is stale (e.g. a later
+        # download attempt failed after wiping tmp) — clear it too, or the UI
+        # shows "installing" forever.
         cloudlog.warning("model_selector: tmp dir incomplete, cleaning up")
         shutil.rmtree(MODELS_TMP_DIR, ignore_errors=True)
+        params.remove(PARAM_PENDING_MODEL_NAME)
         return
 
-    params = Params()
-    model_name = params.get(PARAM_PENDING_MODEL_NAME)
     if not model_name:
         cloudlog.warning("model_selector: PendingModelName empty, cleaning up")
         shutil.rmtree(MODELS_TMP_DIR, ignore_errors=True)
@@ -176,12 +300,15 @@ def compile_pending() -> None:
     env = _tinygrad_env()
 
     try:
-        bases = _bases_to_compile(MODELS_TMP_DIR)
-        cloudlog.warning(f"model_selector: compiling {bases}")
-        for base in bases:
-            _compile_one(base, MODELS_TMP_DIR, env)
+        if supercombo.exists():
+            _compile_supercombo(MODELS_TMP_DIR, env)
+        else:
+            bases = _bases_to_compile(MODELS_TMP_DIR)
+            cloudlog.warning(f"model_selector: compiling {bases}")
+            for base in bases:
+                _compile_one(base, MODELS_TMP_DIR, env)
 
-        _ensure_warp_pkls(MODELS_TMP_DIR, env)
+            _ensure_warp_pkls(MODELS_TMP_DIR, env)
 
         cloudlog.warning("model_selector: installing")
         _atomic_swap(MODELS_TMP_DIR)
