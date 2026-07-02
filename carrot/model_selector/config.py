@@ -17,8 +17,12 @@ DEFAULT_MODEL_DIR = OPENPILOT_ROOT / "selfdrive" / "modeld" / "models"
 MODELS_JSON_URL = (
     "https://raw.githubusercontent.com/happymaj11r/openpilot-models/main/models.json"
 )
+# str.startswith가 튜플을 받으므로 downloader의 검증 로직 변경 없이 동작.
+# releases/download 프리픽스는 95MB 초과 파일(GitHub raw 호스팅 불가, 예: Giga의
+# driving_vision.onnx 122MB)이 Release 에셋으로 배포되는 경우를 위해 필요.
 ALLOWED_URL_PREFIX = (
-    "https://raw.githubusercontent.com/happymaj11r/openpilot-models/"
+    "https://raw.githubusercontent.com/happymaj11r/openpilot-models/",
+    "https://github.com/happymaj11r/openpilot-models/releases/download/",
 )
 
 # Allowed onnx filenames for download (allowlist)
