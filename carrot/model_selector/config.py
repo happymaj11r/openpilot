@@ -9,6 +9,15 @@ MODELS_TMP_DIR = Path("/data/models_tmp")
 MODELS_BACKUP_DIR = Path("/data/models_backup")
 COMPILE_STATUS_FILE = Path("/data/model_compile_status")
 
+# 컴파일 환경 스탬프 — pkl 직렬화 포맷/JIT 인터페이스/tinygrad 세대가 바뀌면
+# 태그를 올린다. /data/models/.compile_env 내용이 현재 태그와 다르면
+# boot_compile 이 보존된 onnx 로 자동 재컴파일한다 (구엔진에서 설치한 모델이
+# 로드 실패 → 격리되는 대신 부팅 시 재빌드되도록).
+COMPILE_ENV_STAMP_NAME = ".compile_env"
+COMPILE_ENV_TAG = "2026.07-tg-oob1"
+# 재컴파일 실패 시 같은 태그로 매 부팅 재시도(부팅 지연)하지 않도록 남기는 마커.
+RECOMPILE_FAILED_MARKER_NAME = ".recompile_failed"
+
 # Default built-in model directory (fallback when no custom model is installed)
 # NOTE: carrot-ms 트리는 실제 소스가 openpilot/ 네임스페이스 하위에 있다
 # (selfdrive → openpilot/selfdrive).

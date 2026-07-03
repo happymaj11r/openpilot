@@ -19,6 +19,8 @@ from openpilot.common.transformations.camera import _ar_ox_fisheye, _os_fisheye
 from openpilot.system.hardware import TICI
 
 from .config import (
+    COMPILE_ENV_STAMP_NAME,
+    COMPILE_ENV_TAG,
     DEFAULT_MODEL_DIR,
     MODELS_BACKUP_DIR,
     MODELS_DIR,
@@ -29,12 +31,14 @@ from .config import (
     PARAM_DRIVING_MODEL_NAME,
     PARAM_PENDING_MODEL_NAME,
     POLICY_BASE,
+    RECOMPILE_FAILED_MARKER_NAME,
     SUPERCOMBO_BASE,
     SUPERCOMBO_PKL_NAME,
     TINYGRAD_COMPILE_ENV_FALLBACK,
     TINYGRAD_COMPILE_ENV_QCOM,
     VISION_BASE,
 )
+from .validator import is_valid_model_dir
 
 
 METADATA_SCRIPT = OPENPILOT_ROOT / "openpilot" / "selfdrive" / "modeld" / "get_model_metadata.py"
@@ -310,6 +314,9 @@ def compile_pending() -> None:
 
             _ensure_warp_pkls(MODELS_TMP_DIR, env)
 
+        # 스왑 전에 스탬프를 넣어 설치와 함께 원자적으로 반영한다.
+        (MODELS_TMP_DIR / COMPILE_ENV_STAMP_NAME).write_text(COMPILE_ENV_TAG + "\n")
+
         cloudlog.warning("model_selector: installing")
         _atomic_swap(MODELS_TMP_DIR)
 
@@ -321,6 +328,57 @@ def compile_pending() -> None:
         shutil.rmtree(MODELS_TMP_DIR, ignore_errors=True)
         _restore_backup_if_needed()
         params.remove(PARAM_PENDING_MODEL_NAME)
+
+
+def _read_text_or_empty(path: Path) -> str:
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return ""
+
+
+def _has_compilable_onnx_set(model_dir: Path) -> bool:
+    supercombo = model_dir / f"{SUPERCOMBO_BASE}.onnx"
+    vision = model_dir / f"{VISION_BASE}.onnx"
+    on_policy = model_dir / f"{ON_POLICY_BASE}.onnx"
+    policy = model_dir / f"{POLICY_BASE}.onnx"
+    return supercombo.exists() or (vision.exists() and (on_policy.exists() or policy.exists()))
+
+
+def recompile_stale_if_needed() -> None:
+    """구 컴파일 환경(다른 tinygrad/pkl 포맷)에서 빌드된 /data/models 를 감지해
+    보존된 onnx 로 재컴파일한다.  스탬프가 현재 태그와 일치하면 no-op.
+
+    onnx 세트가 없거나 직전 재컴파일이 같은 태그로 이미 실패했으면 손대지
+    않는다 — 그 경우 modeld_runner 의 크래시루프 차단기(3회 후 격리)가
+    폴백을 책임진다."""
+    if MODELS_TMP_DIR.exists() or not is_valid_model_dir(MODELS_DIR):
+        return
+    if _read_text_or_empty(MODELS_DIR / COMPILE_ENV_STAMP_NAME) == COMPILE_ENV_TAG:
+        return
+    if _read_text_or_empty(MODELS_DIR / RECOMPILE_FAILED_MARKER_NAME) == COMPILE_ENV_TAG:
+        cloudlog.warning("model_selector: stale model dir, but recompile already failed for this tag — skipping")
+        return
+    if not _has_compilable_onnx_set(MODELS_DIR):
+        cloudlog.error("model_selector: compile env changed but no onnx set preserved — leaving as-is")
+        return
+
+    params = Params()
+    model_name = params.get(PARAM_DRIVING_MODEL_NAME) or "custom"
+    cloudlog.warning(f"model_selector: compile env changed — recompiling {model_name!r} from preserved onnx")
+    MODELS_TMP_DIR.mkdir(parents=True, exist_ok=True)
+    for onnx in MODELS_DIR.glob("*.onnx"):
+        shutil.copy2(onnx, MODELS_TMP_DIR / onnx.name)
+    params.put(PARAM_PENDING_MODEL_NAME, model_name)
+    compile_pending()
+
+    if _read_text_or_empty(MODELS_DIR / COMPILE_ENV_STAMP_NAME) != COMPILE_ENV_TAG:
+        # compile_pending 이 실패 복구(백업 복원/tmp 정리)까지 마친 뒤이므로,
+        # 여기서는 매 부팅 재시도로 인한 부팅 지연만 막는다.
+        try:
+            (MODELS_DIR / RECOMPILE_FAILED_MARKER_NAME).write_text(COMPILE_ENV_TAG + "\n")
+        except OSError:
+            pass
 
 
 def reset_to_default() -> None:
@@ -337,6 +395,7 @@ def reset_to_default() -> None:
 __all__ = [
     "InstallError",
     "compile_pending",
+    "recompile_stale_if_needed",
     "reset_to_default",
     "DEFAULT_MODEL_DIR",
 ]
