@@ -9,14 +9,48 @@ MODELS_TMP_DIR = Path("/data/models_tmp")
 MODELS_BACKUP_DIR = Path("/data/models_backup")
 COMPILE_STATUS_FILE = Path("/data/model_compile_status")
 
-# 컴파일 환경 스탬프 — pkl 직렬화 포맷/JIT 인터페이스/tinygrad 세대가 바뀌면
-# 태그를 올린다. /data/models/.compile_env 내용이 현재 태그와 다르면
+# 컴파일 환경 스탬프 — /data/models/.compile_env 내용이 현재 태그와 다르면
 # boot_compile 이 보존된 onnx 로 자동 재컴파일한다 (구엔진에서 설치한 모델이
 # 로드 실패 → 격리되는 대신 부팅 시 재빌드되도록).
 COMPILE_ENV_STAMP_NAME = ".compile_env"
-COMPILE_ENV_TAG = "2026.07-tg-oob1"
 # 재컴파일 실패 시 같은 태그로 매 부팅 재시도(부팅 지연)하지 않도록 남기는 마커.
 RECOMPILE_FAILED_MARKER_NAME = ".recompile_failed"
+
+# 태그는 git 트리에서 자동 도출한다: 아래 경로에 닿는 커밋이 (자동 체리픽으로
+# 들어오더라도) 태그를 저절로 바꿔 재컴파일을 트리거한다 — 사람이 태그를
+# 올려줄 필요가 없다. 컴파일 산출물(pkl) 호환성을 결정하는 경로만 나열할 것.
+_COMPILE_ENV_PATHS = (
+    "tinygrad_repo",
+    "openpilot/selfdrive/modeld/compile_modeld.py",
+    "openpilot/selfdrive/modeld/helpers.py",
+    "openpilot/selfdrive/modeld/constants.py",
+    "openpilot/selfdrive/modeld/SConscript",
+)
+# git 을 못 쓰는 환경(.git 이 없는 배포본 등)에서의 폴백 — 그 환경에서만 수동 관리.
+_COMPILE_ENV_TAG_FALLBACK = "2026.07-tg-oob1"
+_compile_env_tag_cache: str | None = None
+
+
+def compile_env_tag() -> str:
+    global _compile_env_tag_cache
+    if _compile_env_tag_cache is None:
+        _compile_env_tag_cache = _derive_compile_env_tag()
+    return _compile_env_tag_cache
+
+
+def _derive_compile_env_tag() -> str:
+    import hashlib
+    import subprocess
+    repo_root = Path(__file__).resolve().parents[2]
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", *[f"HEAD:{p}" for p in _COMPILE_ENV_PATHS]],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        digest = hashlib.sha256(out.stdout.encode()).hexdigest()[:16]
+        return f"tg-env:{digest}"
+    except Exception:
+        return _COMPILE_ENV_TAG_FALLBACK
 
 # Default built-in model directory (fallback when no custom model is installed)
 # NOTE: carrot-ms 트리는 실제 소스가 openpilot/ 네임스페이스 하위에 있다

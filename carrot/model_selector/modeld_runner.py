@@ -142,6 +142,20 @@ def _arm_crash_loop_breaker(engine: str) -> str:
     return engine
 
 
+def _upstream_hook_alive() -> bool:
+    """helpers.modeld_pkl_path() 가 MODELD_MODELS_DIR 오버라이드를 실제로
+    반영하는지 확인한다 (호출 전에 env 가 설정돼 있어야 한다).  스쿼시나
+    자동 체리픽으로 훅이 유실되면 upstream modeld 는 크래시 없이 조용히
+    빌트인 모델을 태우므로 격리 폴백으로도 잡히지 않는다 — 여기서 명시적으로
+    걸러내 로그와 상태 파일에 남긴다."""
+    try:
+        from openpilot.selfdrive.modeld.helpers import modeld_pkl_path
+        return Path(modeld_pkl_path(False)).parent == CUSTOM_MODELS_DIR
+    except Exception:
+        cloudlog.exception("[MODEL_SELECTOR] helpers hook self-check errored")
+        return True  # 점검 자체가 불가능하면 기존 동작을 막지 않는다
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--demo", action="store_true", help="A boolean for demo mode.")
@@ -156,6 +170,14 @@ def main() -> None:
             # Must be set before the upstream import so every helpers call —
             # including the USBGPU probe in main() — sees the custom dir.
             os.environ[MODELD_MODELS_DIR_ENV] = str(CUSTOM_MODELS_DIR)
+            if not _upstream_hook_alive():
+                msg = ("[MODEL_SELECTOR] helpers.modeld_pkl_path() ignores MODELD_MODELS_DIR "
+                       "— hook lost (upstream squash/cherry-pick?), falling back to builtin model")
+                print(msg, flush=True)
+                cloudlog.error(msg)
+                _write_status("upstream_modeld", "custom model present but helpers hook lost")
+                os.environ.pop(MODELD_MODELS_DIR_ENV, None)
+                engine = "upstream_default"
         from openpilot.selfdrive.modeld import modeld as upstream_modeld
         upstream_modeld.main(demo=args.demo)
 

@@ -159,3 +159,27 @@ describe=/data/models: vision+on_policy+off_policy
 - **한글 UI** — "모델 셀렉터", "현재 모델", "설치중", "남은 공간", "사용 가능한 모델", "기본 모델 복원", 탭 라벨 "모델"
 - **자동 bootstrap** — `#pageModels` 가 없으면 `/models/page_models.html` 프래그먼트를 `#swipeContainer` 에 주입 (idempotent)
 - **PAGE_ELEMENTS 통합** — `showPage("models")` 로 다른 탭과 동일하게 동작, 탭 이탈 시 정상적으로 숨김 처리
+
+## 유지보수 — upstream 자동 체리픽(Hermes) 대응
+
+upstream 커밋은 주로 자동 체리픽으로 들어오므로, 셀렉터의 보호 장치는 사람의
+기억(체크리스트, 수동 태그 갱신)에 의존하지 않고 전부 **자가 동작**한다:
+
+- **컴파일 환경 스탬프 자동 태그** (`config.compile_env_tag()`)
+  — `tinygrad_repo`, `compile_modeld.py`, `helpers.py`, `constants.py`, `SConscript`
+  의 git 해시에서 태그를 도출. 이 경로에 닿는 커밋이 체리픽되면 태그가 저절로
+  바뀌어 설치본 스탬프와 불일치 → 부팅 시 보존된 onnx 로 자동 재컴파일.
+  git 을 못 쓰는 환경에서만 `_COMPILE_ENV_TAG_FALLBACK` 수동 관리.
+- **helpers 훅 자가 점검** (`modeld_runner._upstream_hook_alive`)
+  — 커스텀 supercombo 기동 직전에 `modeld_pkl_path()` 가 `MODELD_MODELS_DIR` 를
+  실제로 반영하는지 확인. 훅이 스쿼시/체리픽으로 유실되면 (크래시 없이 조용히
+  빌트인을 타는 유형이라 격리 폴백으로 못 잡는다) 명시적으로 로그 + 상태 파일
+  기록 후 빌트인 폴백.
+- **계약 점검 스크립트** (`check_contracts.py`)
+  — 체리픽/머지 후 `python3 carrot/model_selector/check_contracts.py` 실행.
+  컴파일 스크립트 존재, compile_modeld CLI 인자, 메타데이터 파일명 규약,
+  pkl 직렬화 쌍(dump_oob/load_oob), SConscript↔config 플래그, fill_model_msg
+  시그니처, ModelConstants, 프로세스/파람 배선을 검사한다. **FAIL 은 셀렉터
+  코드를 함께 적응시켜야 한다는 신호다.** 표준 라이브러리만 사용하므로 빌드
+  없는 체크아웃에서도 돈다. (Hermes 지시문에 "체리픽 후 이 스크립트 실행 후
+  PASS 확인" 한 줄을 넣어둘 것)

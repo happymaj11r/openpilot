@@ -14,16 +14,16 @@ from openpilot.common.swaglog import cloudlog
 
 from .config import (
     COMPILE_ENV_STAMP_NAME,
-    COMPILE_ENV_TAG,
     MODELS_DIR,
     MODELS_TMP_DIR,
     RECOMPILE_FAILED_MARKER_NAME,
+    compile_env_tag,
 )
 
 
 def _tag_file_matches(path) -> bool:
     try:
-        return path.read_text().strip() == COMPILE_ENV_TAG
+        return path.read_text().strip() == compile_env_tag()
     except (OSError, ValueError):
         # 부재/손상(비 UTF-8) 파일은 불일치로 취급한다.
         return False
