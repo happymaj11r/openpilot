@@ -183,3 +183,11 @@ upstream 커밋은 주로 자동 체리픽으로 들어오므로, 셀렉터의 �
   코드를 함께 적응시켜야 한다는 신호다.** 표준 라이브러리만 사용하므로 빌드
   없는 체크아웃에서도 돈다. (Hermes 지시문에 "체리픽 후 이 스크립트 실행 후
   PASS 확인" 한 줄을 넣어둘 것)
+- **미러 파일 변경 감지** (`check_contracts.py` 의 `modeld-mirror` 검사)
+  — `carrot_modeld.py`/`carrot_parse_model_outputs.py` 는 upstream `modeld.py`/
+  `parse_model_outputs.py` 를 **미러링**하는 독립 엔진이라, 원본 로직이 바뀌어도
+  (예: 커밋 67b6f17d44 의 has_wide_camera 분기) 임포트처럼 자동 반영되지 않는다.
+  `upstream_baseline/` 스냅샷과 현재 파일을 비교해 마지막 리뷰 이후의 변경을
+  FAIL 로 알린다. 대응: 스냅샷과 diff → 필요한 로직을 미러에 이식(무관하면 이식
+  생략) → `python3 carrot/model_selector/check_contracts.py --sync-baselines` 로
+  스냅샷 갱신 → 재실행해 PASS 확인.

@@ -6,7 +6,8 @@ upstream 커밋(특히 자동 체리픽)이 셀렉터가 의존하는 계약을 
 적응시켜야 한다는 신호다 (자동 수정 아님).
 
 용법 (어디서든):
-    python3 carrot/model_selector/check_contracts.py
+    python3 carrot/model_selector/check_contracts.py                    # 계약 점검
+    python3 carrot/model_selector/check_contracts.py --sync-baselines  # 미러 리뷰 후 스냅샷 갱신
 
 표준 라이브러리만 사용한다 — openpilot 빌드/무거운 의존성 불필요.
 """
@@ -47,6 +48,17 @@ EXPECTED_SIGNATURES = {
 # installer/_validate 와 carrot_modeld 가 참조하는 상수 계약
 REQUIRED_MODEL_CONSTANTS = ("MODEL_RUN_FREQ", "MODEL_CONTEXT_FREQ", "DESIRE_LEN",
                             "TRAFFIC_CONVENTION_LEN", "FEATURE_LEN")
+
+# carrot_modeld / carrot_parse_model_outputs 가 "미러링"하는 upstream 파일들.
+# fill_model_msg 처럼 임포트하는 파일과 달리, 이 둘의 로직 변경(예: 커밋
+# 67b6f17d44 의 has_wide_camera 분기)은 자동 반영되지 않고 사람이 판단해
+# 이식해야 한다 — 시그니처가 안 바뀌면 다른 검사로는 잡히지 않는다.
+# 마지막 미러 리뷰 시점의 스냅샷(upstream_baseline/)과 비교해 변경을 알린다.
+BASELINE_DIR = Path(__file__).resolve().parent / "upstream_baseline"
+MIRRORED_UPSTREAM_FILES = {
+    MODELD_DIR / "modeld.py": BASELINE_DIR / "modeld.py.baseline",
+    MODELD_DIR / "parse_model_outputs.py": BASELINE_DIR / "parse_model_outputs.py.baseline",
+}
 
 
 def _func_params(path: Path, name: str) -> list[str] | None:
@@ -135,6 +147,29 @@ def check_model_constants() -> str | None:
     return f"ModelConstants missing: {missing}" if missing else None
 
 
+def check_modeld_mirror() -> str | None:
+    stale = []
+    for current, baseline in MIRRORED_UPSTREAM_FILES.items():
+        if not baseline.is_file():
+            stale.append(f"{baseline.name} 없음")
+        elif current.read_bytes() != baseline.read_bytes():
+            stale.append(current.name)
+    if stale:
+        return ("마지막 미러 리뷰 이후 변경됨: " + ", ".join(stale)
+                + " — upstream_baseline/ 스냅샷과 diff 해서 carrot_modeld.py /"
+                  " carrot_parse_model_outputs.py 에 필요한 로직을 이식한 뒤"
+                  " `check_contracts.py --sync-baselines` 로 스냅샷을 갱신할 것")
+    return None
+
+
+def sync_baselines() -> None:
+    """미러 리뷰(이식) 완료 후 실행 — 현재 upstream 파일을 스냅샷으로 저장."""
+    for current, baseline in MIRRORED_UPSTREAM_FILES.items():
+        baseline.parent.mkdir(parents=True, exist_ok=True)
+        baseline.write_bytes(current.read_bytes())
+        print(f"synced {baseline.relative_to(REPO_ROOT)}")
+
+
 def check_wiring() -> str | None:
     problems = []
     pc = (REPO_ROOT / "openpilot/system/manager/process_config.py").read_text()
@@ -160,10 +195,16 @@ CHECKS = (
     ("fill-model-msg-signatures", check_fill_model_msg_signatures),
     ("model-constants", check_model_constants),
     ("wiring", check_wiring),
+    ("modeld-mirror", check_modeld_mirror),
 )
 
 
 def main() -> int:
+    if "--sync-baselines" in sys.argv:
+        sync_baselines()
+        print("스냅샷 갱신 완료 — 검사를 다시 실행해 PASS 를 확인할 것")
+        return 0
+
     failed = 0
     for name, fn in CHECKS:
         try:
