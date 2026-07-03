@@ -83,6 +83,8 @@ TINYGRAD_COMPILE_ENV_QCOM = {
 }
 TINYGRAD_COMPILE_ENV_FALLBACK = {
     "DEV": "CPU:LLVM",
+    # THREADS=0 은 SConscript 에 없는 의도적 추가 (PC 폴백 컴파일 안정성용).
+    # 커널 구조는 pkl 에 구워지므로 런타임과 충돌하지 않는다.
     "THREADS": "0",
 }
 

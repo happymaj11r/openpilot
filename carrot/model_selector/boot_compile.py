@@ -12,7 +12,21 @@ from __future__ import annotations
 
 from openpilot.common.swaglog import cloudlog
 
-from .config import COMPILE_ENV_STAMP_NAME, COMPILE_ENV_TAG, MODELS_DIR, MODELS_TMP_DIR
+from .config import (
+    COMPILE_ENV_STAMP_NAME,
+    COMPILE_ENV_TAG,
+    MODELS_DIR,
+    MODELS_TMP_DIR,
+    RECOMPILE_FAILED_MARKER_NAME,
+)
+
+
+def _tag_file_matches(path) -> bool:
+    try:
+        return path.read_text().strip() == COMPILE_ENV_TAG
+    except (OSError, ValueError):
+        # 부재/손상(비 UTF-8) 파일은 불일치로 취급한다.
+        return False
 
 
 def run() -> None:
@@ -20,13 +34,18 @@ def run() -> None:
         if MODELS_TMP_DIR.exists():
             from .installer import compile_pending
             compile_pending()
-            return
+            # 여기서 return 하지 않는다 — 성공이면 새 /data/models 의 스탬프가
+            # 일치해 아래 검사가 no-op 이고, 실패 정리로 끝났으면 같은 부팅에서
+            # 바로 복구 재컴파일을 시도해야 한다 (안 그러면 그 부팅 동안 stale
+            # pkl 이 modeld 에 노출되어 크래시루프 → 격리로 이어진다).
 
         # 설치된 커스텀 모델이 구 컴파일 환경(다른 tinygrad/pkl 포맷)에서
         # 빌드된 경우 보존된 onnx 로 부팅 시 자동 재컴파일한다.
-        # 스탬프가 현재 태그와 일치하면 heavy import 없이 바로 통과.
-        stamp = MODELS_DIR / COMPILE_ENV_STAMP_NAME
-        if MODELS_DIR.is_dir() and (not stamp.is_file() or stamp.read_text().strip() != COMPILE_ENV_TAG):
+        # 스탬프 일치(정상) 또는 실패 마커 존재(재시도 무의미) 시에는
+        # heavy import 없이 바로 통과한다.
+        stamp_ok = _tag_file_matches(MODELS_DIR / COMPILE_ENV_STAMP_NAME)
+        already_failed = _tag_file_matches(MODELS_DIR / RECOMPILE_FAILED_MARKER_NAME)
+        if MODELS_DIR.is_dir() and not stamp_ok and not already_failed:
             from .installer import recompile_stale_if_needed
             recompile_stale_if_needed()
     except Exception as e:

@@ -6,27 +6,27 @@ Carrot 파일럿 전용 주행 모델 다운로드/설치/적용 모듈. c3x·c4
 ## 설계 원칙
 
 1. **엔진 분리 + 신구조는 upstream 엔진 재사용**
-   - 기본 모델 (`selfdrive/modeld/models/`) → **upstream `selfdrive/modeld/modeld.py` 가 그대로 담당**
+   - 기본 모델 (`openpilot/selfdrive/modeld/models/`) → **upstream `openpilot/selfdrive/modeld/modeld.py` 가 그대로 담당**
    - 커스텀 **신모델(supercombo, lebowski 구조)** (`/data/models/driving_tinygrad.pkl`)
      → **upstream `modeld.py` 를 그대로 재사용** — `MODELD_MODELS_DIR=/data/models` env 만 설정
-     (`selfdrive/modeld/helpers.py::modeld_pkl_path()` 가 env 를 읽어 경로 전환, monkey-patch 없음)
+     (`openpilot/selfdrive/modeld/helpers.py::modeld_pkl_path()` 가 env 를 읽어 경로 전환, monkey-patch 없음)
    - 커스텀 **구모델(vision+policy 분리)** (`/data/models/`) → **`carrot.model_selector.carrot_modeld` 가 담당** (3-모델 on/off policy 자체 지원)
    - `modeld_runner` 가 부팅 시 `/data/models` 내용으로 셋 중 하나를 택일 실행
    - upstream 이 바뀌어도 legacy 엔진과 무관하게 진행 가능
 
 2. **upstream 파일 최소 침습** (각 1~3줄)
-   - `system/manager/process_config.py` — modeld 엔트리를 `carrot.model_selector.modeld_runner` 로 교체
-   - `system/manager/manager.py::main()` 초입 — `boot_compile.run()` 호출
-   - `selfdrive/modeld/helpers.py::modeld_pkl_path()` — `MODELD_MODELS_DIR` env 오버라이드 (2줄)
-   - `selfdrive/carrot/server/app_factory.py` — 라우터 등록
-   - `selfdrive/carrot/web/index.html` — 네비 버튼 + `page_models.js` 로드 (`?v=…` 캐시 버스팅)
-   - `selfdrive/ui/mici/layouts/home.py` — c4 홈 화면 커밋해시 옆에 `DrivingModelName` 표시
-   - `common/params_keys.h` — `DrivingModelName`, `PendingModelName` 파람 등록
+   - `openpilot/system/manager/process_config.py` — modeld 엔트리를 `openpilot.carrot.model_selector.modeld_runner` 로 교체
+   - `openpilot/system/manager/manager.py::main()` 초입 — `boot_compile.run()` 호출
+   - `openpilot/selfdrive/modeld/helpers.py::modeld_pkl_path()` — `MODELD_MODELS_DIR` env 오버라이드 (2줄)
+   - `openpilot/selfdrive/carrot/server/app.py` — 라우터 등록
+   - `openpilot/selfdrive/carrot/web/index.html` — 네비 버튼 + `page_models.js` 로드 (`?v=…` 캐시 버스팅)
+   - `openpilot/selfdrive/ui/mici/layouts/home.py` — c4 홈 화면 커밋해시 옆에 `DrivingModelName` 표시
+   - `openpilot/common/params_keys.h` — `DrivingModelName`, `PendingModelName` 파람 등록
 
 3. **독립 패키지**
    - 모델 셀렉터 자체 엔진 포함 전부 `carrot/model_selector/` 에 완결
    - `carrot_parse_model_outputs.py` 는 3-모델 분기가 있는 c3-ms 파서 이식본
-   - 원본 파일(`selfdrive/modeld/*`, `common/file_chunker.py` 등)은 읽기/import 전용 (helpers.py env 훅 제외)
+   - 원본 파일(`openpilot/selfdrive/modeld/*`, `openpilot/common/file_chunker.py` 등)은 읽기/import 전용 (helpers.py env 훅 제외)
 
 4. **파일 세트 호환** (신형 단일 onnx 또는 구형 vision + 정책)
    - **신형(supercombo)**: `driving_supercombo.onnx` 단독 — 존재 시 우선 적용

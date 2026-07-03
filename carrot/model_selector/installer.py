@@ -6,6 +6,7 @@ manager patch stays a one-liner.
 """
 from __future__ import annotations
 
+import json
 import os
 import pickle
 import platform
@@ -88,10 +89,20 @@ def _tinygrad_env() -> dict[str, str]:
     return env
 
 
+# 컴파일 서브프로세스 안전 타임아웃 — manager.main() 이 프로세스 기동 전에
+# 동기적으로 기다리므로, 서브프로세스가 행업하면 장치가 부팅 불능으로 멈춘다.
+# 넉넉하게 잡고, 초과 시 InstallError 로 기존 실패 복구 경로에 태운다.
+COMPILE_TIMEOUT_SECONDS = 30 * 60
+
+
 def _run(cmd: list[str], env: dict[str, str] | None = None) -> None:
-    result = subprocess.run(
-        cmd, cwd=str(OPENPILOT_ROOT), env=env, capture_output=True, check=False
-    )
+    try:
+        result = subprocess.run(
+            cmd, cwd=str(OPENPILOT_ROOT), env=env, capture_output=True, check=False,
+            timeout=COMPILE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise InstallError(f"{' '.join(cmd)} timed out after {COMPILE_TIMEOUT_SECONDS}s") from e
     if result.returncode != 0:
         stderr = result.stderr.decode(errors="replace").strip()
         raise InstallError(f"{' '.join(cmd)} failed: {stderr}")
@@ -117,9 +128,9 @@ def _bases_to_compile(tmp_dir: Path) -> list[str]:
 def _compile_one(base: str, tmp_dir: Path, env: dict[str, str]) -> None:
     onnx = tmp_dir / f"{base}.onnx"
     pkl = tmp_dir / f"{base}_tinygrad.pkl"
-    meta = tmp_dir / f"{base}_metadata.pkl"
     cloudlog.warning(f"model_selector: generating metadata for {base}")
-    _run(["python3", str(METADATA_SCRIPT), str(onnx), str(meta)], env=env)
+    # get_model_metadata.py 는 출력 경로를 스스로 정한다: {onnx stem}_metadata.pkl
+    _run(["python3", str(METADATA_SCRIPT), str(onnx)], env=env)
     cloudlog.warning(f"model_selector: compiling {base} with tinygrad")
     _run(["python3", str(COMPILE3_SCRIPT), str(onnx), str(pkl)], env=env)
 
@@ -143,12 +154,26 @@ def _validate_supercombo_metadata(metadata: dict) -> None:
     """Reject models the upstream runtime cannot run BEFORE installing them,
     so an incompatible download fails cleanly instead of crash-looping modeld."""
     from openpilot.common.transformations.model import MEDMODEL_INPUT_SIZE
+    from openpilot.selfdrive.modeld.constants import ModelConstants
 
     input_shapes = metadata.get("input_shapes") or {}
     required = {"img", "big_img", "desire_pulse", "traffic_convention", "action_t", "features_buffer"}
     missing = sorted(required - input_shapes.keys())
     if missing:
         raise InstallError(f"supercombo model is missing required inputs: {missing}")
+
+    # modeld.py 가 고정 길이 배열로 채우는 비이미지 입력들 — 길이가 다르면
+    # 설치는 통과하지만 매 기동 broadcast 크래시(격리 폴백)하므로 미리 거른다.
+    fixed_last_dims = {
+        "desire_pulse": ModelConstants.DESIRE_LEN,
+        "traffic_convention": ModelConstants.TRAFFIC_CONVENTION_LEN,
+        "action_t": 2,  # modeld.py 는 [lat_action_t, long_action_t] 를 넣는다
+        "features_buffer": ModelConstants.FEATURE_LEN,
+    }
+    for name, expected in fixed_last_dims.items():
+        shape = input_shapes[name]
+        if not shape or int(shape[-1]) != int(expected):
+            raise InstallError(f"supercombo {name} shape {shape} incompatible (last dim must be {expected})")
 
     if tuple(input_shapes["img"]) != tuple(input_shapes["big_img"]):
         raise InstallError(
@@ -314,6 +339,12 @@ def compile_pending() -> None:
 
             _ensure_warp_pkls(MODELS_TMP_DIR, env)
 
+            # carrot_modeld 가 기동 시 tinygrad DEV 백엔드를 컴파일 시점과 맞추기
+            # 위해 읽는 파일. 온디바이스(QCOM)는 자동선택과 우연히 일치하지만,
+            # CPU:LLVM 등 폴백 백엔드로 컴파일한 pkl 은 이 파일이 없으면 잘못된
+            # 디바이스로 JIT 재생을 시도한다.
+            (MODELS_TMP_DIR / "tg_compiled_flags.json").write_text(json.dumps({"DEV": env["DEV"]}) + "\n")
+
         # 스왑 전에 스탬프를 넣어 설치와 함께 원자적으로 반영한다.
         (MODELS_TMP_DIR / COMPILE_ENV_STAMP_NAME).write_text(COMPILE_ENV_TAG + "\n")
 
@@ -333,8 +364,17 @@ def compile_pending() -> None:
 def _read_text_or_empty(path: Path) -> str:
     try:
         return path.read_text().strip()
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError 는 UnicodeDecodeError 포함 — 손상 스탬프/마커는 빈 값
+        # (= 불일치) 취급해 재컴파일이 스스로 복구하게 한다.
         return ""
+
+
+def _write_failed_marker() -> None:
+    try:
+        (MODELS_DIR / RECOMPILE_FAILED_MARKER_NAME).write_text(COMPILE_ENV_TAG + "\n")
+    except OSError:
+        pass
 
 
 def _has_compilable_onnx_set(model_dir: Path) -> bool:
@@ -361,24 +401,28 @@ def recompile_stale_if_needed() -> None:
         return
     if not _has_compilable_onnx_set(MODELS_DIR):
         cloudlog.error("model_selector: compile env changed but no onnx set preserved — leaving as-is")
+        # 스스로 해소되지 않는 상태이므로 마커를 남겨 매 부팅 heavy import 를 피한다.
+        _write_failed_marker()
         return
 
     params = Params()
     model_name = params.get(PARAM_DRIVING_MODEL_NAME) or "custom"
     cloudlog.warning(f"model_selector: compile env changed — recompiling {model_name!r} from preserved onnx")
-    MODELS_TMP_DIR.mkdir(parents=True, exist_ok=True)
-    for onnx in MODELS_DIR.glob("*.onnx"):
-        shutil.copy2(onnx, MODELS_TMP_DIR / onnx.name)
-    params.put(PARAM_PENDING_MODEL_NAME, model_name)
+    try:
+        MODELS_TMP_DIR.mkdir(parents=True, exist_ok=True)
+        for onnx in MODELS_DIR.glob("*.onnx"):
+            shutil.copy2(onnx, MODELS_TMP_DIR / onnx.name)
+        params.put(PARAM_PENDING_MODEL_NAME, model_name)
+    except Exception:
+        # 부분 복사된 tmp 를 남기면 다음 부팅이 pending 설치로 오인한다.
+        shutil.rmtree(MODELS_TMP_DIR, ignore_errors=True)
+        raise
     compile_pending()
 
     if _read_text_or_empty(MODELS_DIR / COMPILE_ENV_STAMP_NAME) != COMPILE_ENV_TAG:
         # compile_pending 이 실패 복구(백업 복원/tmp 정리)까지 마친 뒤이므로,
         # 여기서는 매 부팅 재시도로 인한 부팅 지연만 막는다.
-        try:
-            (MODELS_DIR / RECOMPILE_FAILED_MARKER_NAME).write_text(COMPILE_ENV_TAG + "\n")
-        except OSError:
-            pass
+        _write_failed_marker()
 
 
 def reset_to_default() -> None:

@@ -555,7 +555,10 @@ def main(demo=False):
 
       dc = DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm['roadCameraState'].sensor))]
       model_transform_main = get_warp_matrix(device_from_calib_euler, dc.ecam.intrinsics if main_wide_camera else dc.fcam.intrinsics, False).astype(np.float32)
-      model_transform_extra = get_warp_matrix(device_from_calib_euler, dc.ecam.intrinsics, True).astype(np.float32)
+      # 신 modeld.py 와 동일: 와이드캠이 없는 구성에서는 big_img 도 fcam 프레임이므로
+      # fcam 내참행렬로 워프해야 기하학적으로 맞다.
+      has_wide_camera = use_extra_client or main_wide_camera
+      model_transform_extra = get_warp_matrix(device_from_calib_euler, dc.ecam.intrinsics if has_wide_camera else dc.fcam.intrinsics, True).astype(np.float32)
       live_calib_seen = True
 
     traffic_convention = np.zeros(2)
