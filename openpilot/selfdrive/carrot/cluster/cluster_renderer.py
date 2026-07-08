@@ -376,9 +376,17 @@ def radar_point_speed_label(point: RadarPointMarker) -> str:
 
 
 def vehicle_distance_label(vehicle: VehicleBox) -> str:
-    if vehicle.absolute_speed_kph is not None and abs(vehicle.absolute_speed_kph) <= RADAR_STATIC_OBJECT_SPEED_KPH:
+    if (
+        vehicle.absolute_speed_kph is not None
+        and abs(vehicle.absolute_speed_kph) <= RADAR_STATIC_OBJECT_SPEED_KPH
+        and not vehicle.primary
+        and not vehicle.cut_in
+    ):
         return ""
-    return f"{vehicle_distance_m(vehicle):.0f} m"
+    distance = f"{vehicle_distance_m(vehicle):.0f} m"
+    if (vehicle.primary or vehicle.cut_in) and vehicle.label:
+        return f"{vehicle.label} {distance}"
+    return distance
 
 
 def vehicle_distance_m(vehicle: VehicleBox) -> float:
@@ -423,6 +431,10 @@ def radar_info_shows_distance(mode: int) -> bool:
 
 
 def vehicle_metric_color(vehicle: VehicleBox, theme: ClusterTheme, source_color_mode: int) -> tuple[int, int, int]:
+    if vehicle.cut_in:
+        return AMBER
+    if vehicle.primary:
+        return theme.primary_vehicle
     if source_color_mode != CLUSTER_RADAR_SOURCE_COLOR_BY_SOURCE:
         return theme.world_label_text
     if vehicle_source_is_adas(vehicle.source):
@@ -1862,13 +1874,18 @@ class ClusterUiRenderer:
         radar_info_mode: int = CLUSTER_RADAR_INFO_ALL_SPEED_DISTANCE,
         radar_source_color_mode: int = 0,
     ) -> None:
-        if not radar_info_shows_vehicle(radar_info_mode):
+        show_vehicle_info = radar_info_shows_vehicle(radar_info_mode)
+        if not show_vehicle_info and not any(vehicle.primary or vehicle.cut_in for vehicle in vehicles):
             return
         theme = self._current_theme()
         profile_enabled = self.profile_enabled
         profile_stage = self._profile_start()
         ordered = sorted(
-            (vehicle for vehicle in vehicles if vehicle.label),
+            (
+                vehicle
+                for vehicle in vehicles
+                if vehicle.label and (show_vehicle_info or vehicle.primary or vehicle.cut_in)
+            ),
             key=lambda vehicle: (
                 0 if vehicle.primary else 1 if vehicle.cut_in else 2,
                 max(0.0, vehicle.center.y - EGO_FORWARD_M),
@@ -1906,7 +1923,12 @@ class ClusterUiRenderer:
 
             if profile_enabled:
                 layout_stage = time.perf_counter()
-            distance = vehicle_distance_label(vehicle) if radar_info_shows_distance(radar_info_mode) else ""
+            show_important_label = vehicle.primary or vehicle.cut_in
+            distance = (
+                vehicle_distance_label(vehicle)
+                if radar_info_shows_distance(radar_info_mode) or show_important_label
+                else ""
+            )
             speed = vehicle_speed_label(vehicle) if radar_info_shows_speed(radar_info_mode) else ""
             if not distance and not speed:
                 if profile_enabled:
@@ -2042,6 +2064,52 @@ class ClusterUiRenderer:
         )
         for start, end in edges:
             rl.draw_line_3d(vec3(edge_points[start]), vec3(edge_points[end]), outline)
+        if vehicle.primary or vehicle.cut_in:
+            self._draw_selected_vehicle_outline(vehicle, corner, half_width, half_length, z0, z1)
+
+    def _draw_selected_vehicle_outline(
+        self,
+        vehicle: VehicleBox,
+        corner,
+        half_width: float,
+        half_length: float,
+        z0: float,
+        z1: float,
+    ) -> None:
+        outline_color = AMBER if vehicle.cut_in else WHITE
+        outline = rl_color(outline_color, 255)
+        halo_width = half_width + 0.12
+        halo_length = half_length + 0.16
+        halo_z0 = z0 + 0.015
+        halo_z1 = z1 + 0.065
+        halo_base = (
+            corner(-halo_width, -halo_length, halo_z0),
+            corner(halo_width, -halo_length, halo_z0),
+            corner(halo_width, halo_length, halo_z0),
+            corner(-halo_width, halo_length, halo_z0),
+        )
+        halo_top = (
+            corner(-halo_width, -halo_length, halo_z1),
+            corner(halo_width, -halo_length, halo_z1),
+            corner(halo_width, halo_length, halo_z1),
+            corner(-halo_width, halo_length, halo_z1),
+        )
+        halo_edges = (
+            (halo_top[0], halo_top[1]),
+            (halo_top[1], halo_top[2]),
+            (halo_top[2], halo_top[3]),
+            (halo_top[3], halo_top[0]),
+            (halo_base[0], halo_base[1]),
+            (halo_base[1], halo_base[2]),
+            (halo_base[2], halo_base[3]),
+            (halo_base[3], halo_base[0]),
+            (halo_base[0], halo_top[0]),
+            (halo_base[1], halo_top[1]),
+            (halo_base[2], halo_top[2]),
+            (halo_base[3], halo_top[3]),
+        )
+        for start, end in halo_edges:
+            rl.draw_line_3d(vec3(start), vec3(end), outline)
 
     def _draw_quad(
         self,
