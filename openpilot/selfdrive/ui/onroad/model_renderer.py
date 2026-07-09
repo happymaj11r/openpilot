@@ -79,6 +79,8 @@ class ModelRenderer(Widget):
 
     # Transform matrix (3x3 for car space to screen space)
     self._car_space_transform = np.zeros((3, 3), dtype=np.float32)
+    # _map_to_screen이 프레임당 수백 번 호출되므로 numpy 대신 스칼라 곱을 쓰기 위한 평탄화 사본
+    self._transform_flat = [0.0] * 9
     self._transform_dirty = True
     self._clip_region = None
 
@@ -99,6 +101,7 @@ class ModelRenderer(Widget):
 
   def set_transform(self, transform: np.ndarray):
     self._car_space_transform = transform.astype(np.float32)
+    self._transform_flat = [float(v) for v in transform.reshape(-1)]
     self._transform_dirty = True
 
   def _render(self, rect: rl.Rectangle):
@@ -130,6 +133,9 @@ class ModelRenderer(Widget):
 
     # Update model data when needed
     model_updated = sm.updated['modelV2']
+    if model_updated or self._transform_dirty:
+      # carrot 지오메트리 캐시(차선/블라인드스팟)의 무효화 기준
+      self._carrot_geom_rev += 1
     if model_updated or sm.updated['radarState'] or self._transform_dirty:
       if model_updated:
         self._update_raw_points(model)
@@ -343,13 +349,15 @@ class ModelRenderer(Widget):
 
   def _map_to_screen(self, in_x, in_y, in_z):
     """Project a point in car space to screen space"""
-    input_pt = np.array([in_x, in_y, in_z])
-    pt = self._car_space_transform @ input_pt
+    # 프레임당 수백 번 불리는 핫패스라 numpy 행렬곱 대신 스칼라 연산 사용
+    m = self._transform_flat
+    w = m[6] * in_x + m[7] * in_y + m[8] * in_z
 
-    if abs(pt[2]) < 1e-6:
+    if -1e-6 < w < 1e-6:
       return None
 
-    x, y = pt[0] / pt[2], pt[1] / pt[2]
+    x = (m[0] * in_x + m[1] * in_y + m[2] * in_z) / w
+    y = (m[3] * in_x + m[4] * in_y + m[5] * in_z) / w
 
     clip = self._clip_region
     if not (clip.x <= x <= clip.x + clip.width and clip.y <= y <= clip.y + clip.height):
@@ -528,6 +536,15 @@ class ModelRenderer(Widget):
       np.empty((0, 2), dtype=np.float32),
     ]
 
+    # 프레임 단위 재계산 방지용 캐시 상태
+    self._carrot_params_seen = -1          # ui_state.params_refresh_count 추적
+    self._carrot_geom_rev = 0              # modelV2 갱신/투영행렬 변경 시 증가
+    self._carrot_lane_geom_key = None      # 차선 폴리곤 캐시 키
+    self._carrot_lane_vertices: list[np.ndarray] = []
+    self._carrot_lane_vertices_double = np.empty((0, 2), dtype=np.float32)
+    self._carrot_road_vertices: list[np.ndarray] = []
+    self._carrot_bs_geom_rev = -1          # 블라인드스팟 장벽 캐시 리비전
+
 
   def _refresh_carrot_params(self):
     self._carrot_show_lane_info = ui_state.params.get_int("ShowLaneInfo")
@@ -542,6 +559,16 @@ class ModelRenderer(Widget):
 
 
   def _carrot_interp(self, x: float, xp, fp) -> float:
+    # 짧은 구간표는 np.interp 호출 오버헤드가 커서 순수 파이썬으로 처리 (핫패스)
+    if isinstance(xp, (list, tuple)) and len(xp) <= 4:
+      if x <= xp[0]:
+        return float(fp[0])
+      for i in range(1, len(xp)):
+        if x <= xp[i]:
+          x0, x1 = xp[i - 1], xp[i]
+          f0, f1 = fp[i - 1], fp[i]
+          return float(f0) if x1 == x0 else float(f0 + (f1 - f0) * (x - x0) / (x1 - x0))
+      return float(fp[-1])
     return float(np.interp(x, xp, fp))
 
 
@@ -908,46 +935,59 @@ class ModelRenderer(Widget):
     if not sm.valid['modelV2'] or not sm.valid['carState']:
       return
 
-    model = sm['modelV2']
     car_state = sm['carState']
-
-    lane_lines_raw = [np.array([ll.x, ll.y, ll.z], dtype=np.float32).T for ll in model.laneLines]
-    road_edges_raw = [np.array([re.x, re.y, re.z], dtype=np.float32).T for re in model.roadEdges]
-    lane_line_probs = np.array(model.laneLineProbs, dtype=np.float32)
-    road_edge_stds = np.array(model.roadEdgeStds, dtype=np.float32)
-
-    if lane_lines_raw[0].shape[0] == 0:
-      return
-
-    max_idx = self._get_path_length_idx(lane_lines_raw[0][:, 0], np.clip(lane_lines_raw[0][-1, 0], MIN_DRAW_DISTANCE, MAX_DRAW_DISTANCE))
     left_lane_line = car_state.leftLaneLine
     right_lane_line = car_state.rightLaneLine
 
-    lane_vertices = []
-    lane_vertices_double = np.empty((0, 2), dtype=np.float32)
+    # _update_raw_points가 모델 갱신 시 만들어둔 numpy 배열을 재사용 (capnp 재변환 금지)
+    if self._lane_lines[0].raw_points.shape[0] == 0:
+      return
 
-    for i in range(4):
-      line_width = 0.025
-      if i == 1 and left_lane_line >= 20:
-        line_width = 0.05
-      pts = self._map_line_to_polygon(lane_lines_raw[i], line_width, 0.0, max_idx, np.clip(lane_lines_raw[0][-1, 0], MIN_DRAW_DISTANCE, MAX_DRAW_DISTANCE))
-      lane_vertices.append(pts)
+    # 지오메트리는 모델 갱신/투영행렬 변경 시에만 재계산, 그 외 프레임은 캐시로 드로잉만
+    lane_key = (self._carrot_geom_rev, left_lane_line >= 20, self._carrot_show_lane_info > 1)
+    if lane_key != self._carrot_lane_geom_key:
+      self._carrot_lane_geom_key = lane_key
 
-      if i == 1:
-        lane_vertices_double = self._map_line_to_polygon(
-          lane_lines_raw[i],
-          line_width,
-          0.0,
-          max_idx,
-          np.clip(lane_lines_raw[0][-1, 0], MIN_DRAW_DISTANCE, MAX_DRAW_DISTANCE),
-          True,
-          -0.3,
-        )
+      lane_x = self._lane_lines[0].raw_points[:, 0]
+      max_distance = np.clip(lane_x[-1], MIN_DRAW_DISTANCE, MAX_DRAW_DISTANCE)
+      max_idx = self._get_path_length_idx(lane_x, max_distance)
 
-    road_vertices = []
-    max_idx_road_edge = self._get_path_length_idx(lane_lines_raw[0][:, 0], 100.0)
-    for i in range(2):
-      road_vertices.append(self._map_line_to_polygon(road_edges_raw[i], 0.025, 0.0, max_idx_road_edge, 100.0))
+      lane_vertices = []
+      lane_vertices_double = np.empty((0, 2), dtype=np.float32)
+
+      for i in range(4):
+        line_width = 0.025
+        if i == 1 and left_lane_line >= 20:
+          line_width = 0.05
+        pts = self._map_line_to_polygon(self._lane_lines[i].raw_points, line_width, 0.0, max_idx, max_distance)
+        lane_vertices.append(pts)
+
+        if i == 1:
+          lane_vertices_double = self._map_line_to_polygon(
+            self._lane_lines[i].raw_points,
+            line_width,
+            0.0,
+            max_idx,
+            max_distance,
+            True,
+            -0.3,
+          )
+
+      road_vertices = []
+      if self._carrot_show_lane_info > 1:
+        max_idx_road_edge = self._get_path_length_idx(lane_x, 100.0)
+        for i in range(2):
+          road_vertices.append(self._map_line_to_polygon(self._road_edges[i].raw_points, 0.025, 0.0, max_idx_road_edge, 100.0))
+
+      self._carrot_lane_vertices = lane_vertices
+      self._carrot_lane_vertices_double = lane_vertices_double
+      self._carrot_road_vertices = road_vertices
+
+    lane_vertices = self._carrot_lane_vertices
+    lane_vertices_double = self._carrot_lane_vertices_double
+    road_vertices = self._carrot_road_vertices
+    lane_line_probs = self._lane_line_probs
+    road_edge_stds = self._road_edge_stds
 
     for i in range(4):
       if lane_vertices[i].size == 0:
@@ -982,18 +1022,13 @@ class ModelRenderer(Widget):
 
 
   def _update_blind_spot_barriers_carrot(self, sm):
-    if not sm.valid['modelV2']:
+    # _update_raw_points가 만들어둔 경로 배열 재사용 (model.position과 동일 데이터)
+    model_position = self._path.raw_points
+    if model_position.shape[0] == 0:
       self._carrot_lane_barrier_vertices[0] = np.empty((0, 2), dtype=np.float32)
       self._carrot_lane_barrier_vertices[1] = np.empty((0, 2), dtype=np.float32)
       return
 
-    model = sm['modelV2']
-    if len(model.position.x) == 0:
-      self._carrot_lane_barrier_vertices[0] = np.empty((0, 2), dtype=np.float32)
-      self._carrot_lane_barrier_vertices[1] = np.empty((0, 2), dtype=np.float32)
-      return
-
-    model_position = np.array([model.position.x, model.position.y, model.position.z], dtype=np.float32).T
     max_idx_barrier = self._get_path_length_idx(model_position[:, 0], 40.0)
 
     def build_barrier(y_shift: float) -> np.ndarray:
@@ -1066,8 +1101,6 @@ class ModelRenderer(Widget):
     if not sm.valid['modelV2'] or not sm.valid['carState'] or not sm.valid['radarState']:
       return
 
-    self._update_blind_spot_barriers_carrot(sm)
-
     warn_color = rl.Color(255, 215, 0, 150)
     assist_color = rl.Color(0, 204, 0, 150)
 
@@ -1086,14 +1119,25 @@ class ModelRenderer(Widget):
     right_lane_change = (lane_change_state == LaneChangeState.preLaneChange) and ("right" in lane_change_direction)
     left_lane_change = (lane_change_state == LaneChangeState.preLaneChange) and ("left" in lane_change_direction)
 
+    left_assist = lead_left.status and float(lead_left.dRel) < float(car_state.vEgo) * 3.0 and left_lane_change
+    right_assist = lead_right.status and float(lead_right.dRel) < float(car_state.vEgo) * 3.0 and right_lane_change
+
+    # 실제로 그릴 게 없으면 장벽 계산 자체를 생략 (기존엔 매 프레임 무조건 계산)
+    if not (left_blindspot or right_blindspot or left_assist or right_assist):
+      return
+
+    if self._carrot_bs_geom_rev != self._carrot_geom_rev:
+      self._update_blind_spot_barriers_carrot(sm)
+      self._carrot_bs_geom_rev = self._carrot_geom_rev
+
     if left_blindspot:
       self._draw_blind_spot_segments_carrot(self._carrot_lane_barrier_vertices[0], warn_color)
-    elif lead_left.status and float(lead_left.dRel) < float(car_state.vEgo) * 3.0 and left_lane_change:
+    elif left_assist:
       self._draw_blind_spot_segments_carrot(self._carrot_lane_barrier_vertices[0], assist_color)
 
     if right_blindspot:
       self._draw_blind_spot_segments_carrot(self._carrot_lane_barrier_vertices[1], warn_color)
-    elif lead_right.status and float(lead_right.dRel) < float(car_state.vEgo) * 3.0 and right_lane_change:
+    elif right_assist:
       self._draw_blind_spot_segments_carrot(self._carrot_lane_barrier_vertices[1], assist_color)
 
 
@@ -1563,7 +1607,10 @@ class ModelRenderer(Widget):
 
 
   def _draw_path_carrot(self, sm):
-    self._refresh_carrot_params()
+    # Params는 파일 I/O라 ui_state가 5초 주기로 갱신될 때만 다시 읽는다
+    if self._carrot_params_seen != ui_state.params_refresh_count:
+      self._refresh_carrot_params()
+      self._carrot_params_seen = ui_state.params_refresh_count
     if not self._make_path_data_carrot(sm):
       return
 
