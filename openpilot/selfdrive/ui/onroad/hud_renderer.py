@@ -159,6 +159,9 @@ class HudRenderer(Widget):
     self._voltage = 0.0
     self._plot_renderer = None
 
+    self._gap_cache = 8
+    self._gap_cache_time = 0.0
+
   def _update_state(self) -> None:
     """Update HUD state based on car state and controls state."""
     sm = ui_state.sm
@@ -350,13 +353,16 @@ class HudRenderer(Widget):
     return "M"
 
   def _get_cruise_gap(self) -> int:
-    try:
-      personality = ui_state.params.get_int("LongitudinalPersonality")
-      gap = int(personality) + 1
-    except Exception:
-      gap = 8
+    # 갭 버튼 반응성은 유지하되 파일 읽기는 1초에 한 번으로 제한
+    now = time.monotonic()
+    if now - self._gap_cache_time >= 1.0:
+      self._gap_cache_time = now
+      try:
+        self._gap_cache = ui_state.params.get_int("LongitudinalPersonality") + 1
+      except Exception:
+        self._gap_cache = 8
 
-    return gap
+    return self._gap_cache
 
   def _get_driving_mode_text_and_color(self) -> tuple[str, rl.Color]:
     try:
@@ -757,7 +763,7 @@ class HudRenderer(Widget):
     )
 
   def _draw_carrot_main_background(self, bx: int, by: int):
-    show_device_state = ui_state.params.get_int("ShowDeviceState")
+    show_device_state = ui_state.show_device_state
 
     x_spd_limit, x_sign_type, _ = self._get_speed_limit_info()
     cam_detected = x_spd_limit > 0 and x_sign_type not in (22, 4)
@@ -788,7 +794,7 @@ class HudRenderer(Widget):
       )
 
   def _draw_carrot_device_state(self, bx: int, by: int):
-    show_device_state = ui_state.params.get_int("ShowDeviceState")
+    show_device_state = ui_state.show_device_state
     if show_device_state <= 0:
       return
 
@@ -823,7 +829,7 @@ class HudRenderer(Widget):
       draw_text_ui_style(f"{self._voltage:.1f}V", dx3, dy + 40, 40, rl.WHITE, font=self._font_display, border_width=1.0, shadow_offset=4.0, align="center_bottom")
 
   def _draw_date_time(self, rect: rl.Rectangle) -> None:
-    show_datetime = ui_state.params.get_int("ShowDateTime")
+    show_datetime = ui_state.show_date_time
     if show_datetime <= 0:
       return
 
@@ -1372,7 +1378,7 @@ class PlotRenderer:
       )
 
   def draw(self, rect: rl.Rectangle, font) -> None:
-    show_plot_mode = ui_state.params.get_int('ShowPlotMode')
+    show_plot_mode = ui_state.show_plot_mode
     if show_plot_mode == 0:
       return
     try:

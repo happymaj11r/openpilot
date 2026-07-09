@@ -53,6 +53,13 @@ class AugmentedRoadView(CameraView):
     # debug
     self._pm = messaging.PubMaster(['uiDebug'])
 
+    # 테두리 텍스트용 Params 캐시 (5초 주기 ui_state 갱신에 맞춰 재읽기)
+    self._border_params_seen = -1
+    self._border_top_left = ""
+    self._border_bottom_left = ""
+    self._border_bottom_right = ""
+    self._border_custom_sr = 0.0
+
 
 
   def _render(self, rect):
@@ -372,28 +379,38 @@ class AugmentedRoadView(CameraView):
     line_margin = 2.0
 
     top = str(car_state.logCarrot)
-    top_left = ""
     top_right = ""
     bottom = ""
-    bottom_left = ""
-    bottom_right = ""
 
-    car_name = ui_state.params.get("CarName") or ""
+    # 차량명/브랜치명 등은 주행 중 사실상 불변 — 5초 주기로만 파일에서 읽는다
+    if self._border_params_seen != ui_state.params_refresh_count:
+      self._border_params_seen = ui_state.params_refresh_count
 
-    if ui_state.params.get_int("HyundaiCameraSCC") > 0:
-      car_name += "(CAMERA SCC)"
-    else:
-      try:
-        if sm.alive["carParams"] and sm["carParams"].openpilotLongitudinalControl:
-          car_name += " - OP Long"
-      except Exception:
-        pass
+      car_name = ui_state.params.get("CarName") or ""
+      if ui_state.params.get_int("HyundaiCameraSCC") > 0:
+        car_name += "(CAMERA SCC)"
+      else:
+        try:
+          if sm.alive["carParams"] and sm["carParams"].openpilotLongitudinalControl:
+            car_name += " - OP Long"
+        except Exception:
+          pass
 
-    nnff_model_name = ui_state.params.get("NNFFModelName") or ""
-    if len(nnff_model_name) > 0:
-      car_name += ",NNFF"
+      nnff_model_name = ui_state.params.get("NNFFModelName") or ""
+      if len(nnff_model_name) > 0:
+        car_name += ",NNFF"
 
-    top_left = car_name
+      self._border_top_left = car_name
+      self._border_custom_sr = ui_state.params.get_float("CustomSR") / 10.0
+
+      branch = ui_state.params.get("GitBranch") or ""
+      model = ui_state.params.get("DrivingModelName") or ""
+      self._border_bottom_left = f"{branch} ({model})" if model else branch
+      self._border_bottom_right = ui_state.params_memory.get("NetworkAddress") or ""
+
+    top_left = self._border_top_left
+    bottom_left = self._border_bottom_left
+    bottom_right = self._border_bottom_right
 
     try:
       top_right_parts = []
@@ -413,8 +430,7 @@ class AugmentedRoadView(CameraView):
 
       if sm.alive["liveParameters"]:
         lp = sm["liveParameters"]
-        custom_sr = ui_state.params.get_float("CustomSR") / 10.0
-        top_right_parts.append(f"SR({lp.steerRatio:.1f},{custom_sr:.1f})")
+        top_right_parts.append(f"SR({lp.steerRatio:.1f},{self._border_custom_sr:.1f})")
 
       top_right = ", ".join(top_right_parts)
     except Exception:
@@ -424,12 +440,6 @@ class AugmentedRoadView(CameraView):
     if sm.alive["lateralPlan"]:
       lat_plan = sm["lateralPlan"]
       bottom = str(lat_plan.latDebugText)
-
-    branch = ui_state.params.get("GitBranch") or ""
-    model = ui_state.params.get("DrivingModelName") or ""
-    bottom_left = f"{branch} ({model})" if model else branch
-
-    bottom_right = ui_state.params_memory.get("NetworkAddress") or ""
 
     # text positions
     top_text_y = y + line_margin

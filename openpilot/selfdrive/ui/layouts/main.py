@@ -1,3 +1,4 @@
+import time
 import pyray as rl
 from enum import IntEnum
 import openpilot.cereal.messaging as messaging
@@ -42,18 +43,26 @@ class MainLayout(Widget):
     self._onboarding_window = OnboardingWindow()
     if not self._onboarding_window.completed:
       gui_app.push_widget(self._onboarding_window)
-    # carrot_man    
+    # carrot_man
     self._last_carrot_cmd_idx = -1
+    self._screen_record_param = False
+    self._screen_record_param_time = 0.0
 
-  @staticmethod
-  def _sync_screen_record_state(requested: bool) -> bool:
+  def _sync_screen_record_state(self, requested: bool) -> bool:
     recording = gui_app.is_recording()
     if requested != recording:
       ui_state.params.put_bool_nonblocking("ScreenRecord", recording)
+      # 다음 TTL 갱신 전까지 캐시가 예전 값으로 녹화를 되살리지 않도록 동기화
+      self._screen_record_param = recording
     return recording
 
   def _handle_carrot_record_cmd(self, sm) -> bool:
-    screen_record = ui_state.params.get_bool("ScreenRecord")
+    # 파라미터 파일 읽기는 1초에 한 번으로 제한 (carrotMan 명령 경로는 매 프레임 유지)
+    now = time.monotonic()
+    if now - self._screen_record_param_time >= 1.0:
+      self._screen_record_param_time = now
+      self._screen_record_param = ui_state.params.get_bool("ScreenRecord")
+    screen_record = self._screen_record_param
     if screen_record:
       gui_app.start_recording()
     else:
