@@ -1,3 +1,5 @@
+from typing import Optional
+
 import numpy as np
 import pyray as rl
 
@@ -7,7 +9,7 @@ _use_ffi = True
 
 
 def draw_polygon_fast(origin_rect: rl.Rectangle, points: np.ndarray,
-                      color: rl.Color | None = None, gradient: Gradient | None = None) -> None:
+                      color: Optional[rl.Color] = None, gradient: Gradient | None = None) -> None:
   """upstream draw_polygon과 동일한 결과를 그리는 carrot 전용 고속 경로.
 
   트라이앵글 스트립을 float32 numpy 버퍼로 GPU에 직접 전달해서(Vector2[]와 메모리
