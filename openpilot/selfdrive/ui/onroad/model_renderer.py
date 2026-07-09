@@ -79,8 +79,6 @@ class ModelRenderer(Widget):
 
     # Transform matrix (3x3 for car space to screen space)
     self._car_space_transform = np.zeros((3, 3), dtype=np.float32)
-    # _map_to_screen이 프레임당 수백 번 호출되므로 numpy 대신 스칼라 곱을 쓰기 위한 평탄화 사본
-    self._transform_flat = [0.0] * 9
     self._transform_dirty = True
     self._clip_region = None
 
@@ -101,7 +99,6 @@ class ModelRenderer(Widget):
 
   def set_transform(self, transform: np.ndarray):
     self._car_space_transform = transform.astype(np.float32)
-    self._transform_flat = [float(v) for v in transform.reshape(-1)]
     self._transform_dirty = True
 
   def _render(self, rect: rl.Rectangle):
@@ -133,9 +130,6 @@ class ModelRenderer(Widget):
 
     # Update model data when needed
     model_updated = sm.updated['modelV2']
-    if model_updated or self._transform_dirty:
-      # carrot 지오메트리 캐시(차선/블라인드스팟)의 무효화 기준
-      self._carrot_geom_rev += 1
     if model_updated or sm.updated['radarState'] or self._transform_dirty:
       if model_updated:
         self._update_raw_points(model)
@@ -349,15 +343,13 @@ class ModelRenderer(Widget):
 
   def _map_to_screen(self, in_x, in_y, in_z):
     """Project a point in car space to screen space"""
-    # 프레임당 수백 번 불리는 핫패스라 numpy 행렬곱 대신 스칼라 연산 사용
-    m = self._transform_flat
-    w = m[6] * in_x + m[7] * in_y + m[8] * in_z
+    input_pt = np.array([in_x, in_y, in_z])
+    pt = self._car_space_transform @ input_pt
 
-    if -1e-6 < w < 1e-6:
+    if abs(pt[2]) < 1e-6:
       return None
 
-    x = (m[0] * in_x + m[1] * in_y + m[2] * in_z) / w
-    y = (m[3] * in_x + m[4] * in_y + m[5] * in_z) / w
+    x, y = pt[0] / pt[2], pt[1] / pt[2]
 
     clip = self._clip_region
     if not (clip.x <= x <= clip.x + clip.width and clip.y <= y <= clip.y + clip.height):
@@ -536,9 +528,11 @@ class ModelRenderer(Widget):
       np.empty((0, 2), dtype=np.float32),
     ]
 
-    # 프레임 단위 재계산 방지용 캐시 상태
-    self._carrot_params_seen = -1          # ui_state.params_refresh_count 추적
+    # 프레임 단위 재계산 방지용 캐시 상태 (upstream 코드 비수정 원칙 — 상태와 감지 로직 모두 carrot 전용)
+    self._carrot_params_time = -10.0       # Params 재읽기 TTL 기준 시각 (rl.get_time, 5초)
     self._carrot_geom_rev = 0              # modelV2 갱신/투영행렬 변경 시 증가
+    self._carrot_transform_ref: np.ndarray | None = None  # set_transform이 만든 배열 identity 추적
+    self._carrot_transform_flat = [0.0] * 9  # 스칼라 투영용 평탄화 사본
     self._carrot_lane_geom_key = None      # 차선 폴리곤 캐시 키
     self._carrot_lane_vertices: list[np.ndarray] = []
     self._carrot_lane_vertices_double = np.empty((0, 2), dtype=np.float32)
@@ -557,6 +551,33 @@ class ModelRenderer(Widget):
     self._carrot_show_path_color_lane = ui_state.params.get_int("ShowPathColorLane")
     self._carrot_show_path_color_cruise_off = ui_state.params.get_int("ShowPathColorCruiseOff")
 
+
+  def _refresh_carrot_frame_state(self, sm):
+    # upstream set_transform/_render를 건드리지 않고 carrot 쪽에서 변경 감지:
+    # set_transform은 매번 새 배열을 만들므로 identity 비교로 투영행렬 변경을 알 수 있다
+    changed = self._carrot_transform_ref is not self._car_space_transform
+    if changed:
+      self._carrot_transform_ref = self._car_space_transform
+      self._carrot_transform_flat = [float(v) for v in self._car_space_transform.reshape(-1)]
+    if changed or sm.updated['modelV2']:
+      self._carrot_geom_rev += 1
+
+  def _map_to_screen_carrot(self, in_x, in_y, in_z):
+    # _map_to_screen과 동작 동일 — 프레임당 수백 번 불리는 carrot 핫패스라 numpy 대신 스칼라 연산
+    m = self._carrot_transform_flat
+    w = m[6] * in_x + m[7] * in_y + m[8] * in_z
+
+    if -1e-6 < w < 1e-6:
+      return None
+
+    x = (m[0] * in_x + m[1] * in_y + m[2] * in_z) / w
+    y = (m[3] * in_x + m[4] * in_y + m[5] * in_z) / w
+
+    clip = self._clip_region
+    if not (clip.x <= x <= clip.x + clip.width and clip.y <= y <= clip.y + clip.height):
+      return None
+
+    return (x, y)
 
   def _carrot_interp(self, x: float, xp, fp) -> float:
     # 짧은 구간표는 np.interp 호출 오버헤드가 커서 순수 파이썬으로 처리 (핫패스)
@@ -804,8 +825,8 @@ class ModelRenderer(Widget):
       self._carrot_radar_dist = float(lead_one.dRel) if lead_one.radar else 0.0
       self._carrot_lead_status = True
 
-    left_pt = self._map_to_screen(max_distance, y - 1.2, z + 1.22)
-    right_pt = self._map_to_screen(max_distance, y + 1.2, z + 1.22)
+    left_pt = self._map_to_screen_carrot(max_distance, y - 1.2, z + 1.22)
+    right_pt = self._map_to_screen_carrot(max_distance, y + 1.2, z + 1.22)
     if left_pt is not None and right_pt is not None:
       lex, ley = left_pt
       rex, rey = right_pt
@@ -834,15 +855,15 @@ class ModelRenderer(Widget):
     tf_idx = self._get_path_length_idx(line[:, 0], self._carrot_tf_distance)
     tf_y = float(line[tf_idx, 1])
     tf_z = float(line[tf_idx, 2])
-    self._carrot_tf_left = self._map_to_screen(self._carrot_tf_distance, tf_y - 1.0, tf_z + 1.22)
-    self._carrot_tf_right = self._map_to_screen(self._carrot_tf_distance, tf_y + 1.0, tf_z + 1.22)
+    self._carrot_tf_left = self._map_to_screen_carrot(self._carrot_tf_distance, tf_y - 1.0, tf_z + 1.22)
+    self._carrot_tf_right = self._map_to_screen_carrot(self._carrot_tf_distance, tf_y + 1.0, tf_z + 1.22)
 
     if lead_two is not None and lead_one is not None and lead_two.radar and lead_two.dRel > lead_one.dRel + 3.0:
       lead_two_idx = self._get_path_length_idx(line[:, 0], lead_two.dRel)
       z2 = float(line[lead_two_idx, 2])
       y2 = float(-lead_two.yRel)
-      lead_two_left = self._map_to_screen(lead_two.dRel, y2 - 1.2, z2 + 1.22)
-      lead_two_right = self._map_to_screen(lead_two.dRel, y2 + 1.2, z2 + 1.22)
+      lead_two_left = self._map_to_screen_carrot(lead_two.dRel, y2 - 1.2, z2 + 1.22)
+      lead_two_right = self._map_to_screen_carrot(lead_two.dRel, y2 + 1.2, z2 + 1.22)
 
       if lead_two_left is not None and lead_two_right is not None:
         if self._carrot_lead_two_status > 0:
@@ -1039,12 +1060,12 @@ class ModelRenderer(Widget):
         if model_position[i, 0] < 0:
           continue
 
-        left = self._map_to_screen(
+        left = self._map_to_screen_carrot(
           model_position[i, 0],
           model_position[i, 1] + y_shift,
           model_position[i, 2] + (1.2 - 0.05),
         )
-        right = self._map_to_screen(
+        right = self._map_to_screen_carrot(
           model_position[i, 0],
           model_position[i, 1] + y_shift,
           model_position[i, 2] + (1.2 - 0.6),
@@ -1167,7 +1188,7 @@ class ModelRenderer(Widget):
           continue
 
         z = float(lane_z[idx]) - 0.61
-        side = self._map_to_screen(d_rel, -float(lead.yRel), z)
+        side = self._map_to_screen_carrot(d_rel, -float(lead.yRel), z)
         if side is None:
           continue
 
@@ -1184,7 +1205,7 @@ class ModelRenderer(Widget):
           t = self._carrot_radar_lat_factor
           a_d_rel = max(2.0, d_rel + v * t)
           a_y_rel = y_rel + v_lat * t
-          a_side = self._map_to_screen(a_d_rel, -a_y_rel, z)
+          a_side = self._map_to_screen_carrot(a_d_rel, -a_y_rel, z)
 
           line_color = rl.Color(0, 203, 0, 255) if v_sum > 0.0 else rl.Color(255, 0, 0, 255)
           if a_side is not None:
@@ -1221,8 +1242,8 @@ class ModelRenderer(Widget):
       z_off = self._carrot_interp(float(line[i, 0]), [0.0, 100.0], [z_off_start, z_off_end])
       y_off = self._carrot_interp(z_off, [-3.0, 0.0, 3.0], [1.5, 0.5, 1.5]) * width_apply
 
-      left = self._map_to_screen(line[i, 0], line[i, 1] - y_off, line[i, 2] + z_off)
-      right = self._map_to_screen(line[i, 0], line[i, 1] + y_off, line[i, 2] + z_off)
+      left = self._map_to_screen_carrot(line[i, 0], line[i, 1] - y_off, line[i, 2] + z_off)
+      right = self._map_to_screen_carrot(line[i, 0], line[i, 1] + y_off, line[i, 2] + z_off)
       if left is not None and right is not None:
         if not allow_invert and len(left_points) > 0 and left[1] > left_points[-1][1]:
           continue
@@ -1266,8 +1287,8 @@ class ModelRenderer(Widget):
       line_y1 = self._carrot_interp(idx, idxs, line_y)
       line_z1 = self._carrot_interp(idx, idxs, line_z)
 
-      left = self._map_to_screen(dist, line_y1 - y_off, line_z1 + z_off)
-      right = self._map_to_screen(dist, line_y1 + y_off, line_z1 + z_off)
+      left = self._map_to_screen_carrot(dist, line_y1 - y_off, line_z1 + z_off)
+      right = self._map_to_screen_carrot(dist, line_y1 + y_off, line_z1 + z_off)
 
       if left is not None and right is not None:
         if not allow_invert and len(left_points) > 0 and left[1] > left_points[-1][1]:
@@ -1361,8 +1382,8 @@ class ModelRenderer(Widget):
         line_y1 = self._carrot_interp(idx, idxs, line_y)
         line_z1 = self._carrot_interp(idx, idxs, line_z)
 
-        left = self._map_to_screen(dist_j, line_y1 - y_off, line_z1 + z_off)
-        right = self._map_to_screen(dist_j, line_y1 + y_off, line_z1 + z_off)
+        left = self._map_to_screen_carrot(dist_j, line_y1 - y_off, line_z1 + z_off)
+        right = self._map_to_screen_carrot(dist_j, line_y1 + y_off, line_z1 + z_off)
         if left is not None and right is not None:
           left_points.append(left)
           right_points.insert(0, right)
@@ -1607,10 +1628,13 @@ class ModelRenderer(Widget):
 
 
   def _draw_path_carrot(self, sm):
-    # Params는 파일 I/O라 ui_state가 5초 주기로 갱신될 때만 다시 읽는다
-    if self._carrot_params_seen != ui_state.params_refresh_count:
+    # carrot 드로잉 중 가장 먼저 실행되므로 여기서 프레임 상태(투영행렬/지오메트리 리비전)를 갱신
+    self._refresh_carrot_frame_state(sm)
+    # Params는 파일 I/O라 5초 TTL로만 다시 읽는다
+    now = rl.get_time()
+    if now - self._carrot_params_time >= 5.0:
+      self._carrot_params_time = now
       self._refresh_carrot_params()
-      self._carrot_params_seen = ui_state.params_refresh_count
     if not self._make_path_data_carrot(sm):
       return
 

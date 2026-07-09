@@ -54,8 +54,8 @@ class AugmentedRoadView(CameraView):
     # debug
     self._pm = messaging.PubMaster(['uiDebug'])
 
-    # 테두리 텍스트용 Params 캐시 (5초 주기 ui_state 갱신에 맞춰 재읽기)
-    self._border_params_seen = -1
+    # 테두리 텍스트용 Params 캐시 (5초 TTL로 재읽기)
+    self._border_params_time = 0.0
     self._border_top_left = ""
     self._border_bottom_left = ""
     self._border_bottom_right = ""
@@ -423,9 +423,10 @@ class AugmentedRoadView(CameraView):
     top_right = ""
     bottom = ""
 
-    # 차량명/브랜치명 등은 주행 중 사실상 불변 — 5초 주기로만 파일에서 읽는다
-    if self._border_params_seen != ui_state.params_refresh_count:
-      self._border_params_seen = ui_state.params_refresh_count
+    # 차량명/브랜치명 등은 주행 중 사실상 불변 — 5초 TTL로만 파일에서 읽는다
+    now = time.monotonic()
+    if now - self._border_params_time >= 5.0:
+      self._border_params_time = now
 
       car_name = ui_state.params.get("CarName") or ""
       if ui_state.params.get_int("HyundaiCameraSCC") > 0:

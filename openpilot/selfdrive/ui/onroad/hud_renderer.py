@@ -162,9 +162,17 @@ class HudRenderer(Widget):
     self._gap_cache = 8
     self._gap_cache_time = 0.0
     self._device_info_loaded = False
+    self._show_device_state = 0
+    self._hud_params_time = 0.0
 
   def _update_state(self) -> None:
     """Update HUD state based on car state and controls state."""
+    # 표시 옵션 Params는 파일 I/O라 5초 TTL로만 다시 읽는다
+    now = time.monotonic()
+    if now - self._hud_params_time >= 5.0:
+      self._hud_params_time = now
+      self._show_device_state = ui_state.params.get_int("ShowDeviceState")
+
     sm = ui_state.sm
     if sm.recv_frame["carState"] < ui_state.started_frame:
       self.is_cruise_set = False
@@ -764,7 +772,7 @@ class HudRenderer(Widget):
     )
 
   def _draw_carrot_main_background(self, bx: int, by: int):
-    show_device_state = ui_state.show_device_state
+    show_device_state = self._show_device_state
 
     x_spd_limit, x_sign_type, _ = self._get_speed_limit_info()
     cam_detected = x_spd_limit > 0 and x_sign_type not in (22, 4)
@@ -795,7 +803,7 @@ class HudRenderer(Widget):
       )
 
   def _draw_carrot_device_state(self, bx: int, by: int):
-    show_device_state = ui_state.show_device_state
+    show_device_state = self._show_device_state
     if show_device_state <= 0:
       return
 
@@ -1196,6 +1204,8 @@ class PlotRenderer:
     self._plot_height = 300.0
     self._plot_dx = 2.0
     self._show_plot_mode_prev = -1
+    self._plot_mode_cached = 0
+    self._plot_params_time = 0.0
 
   def _clear(self):
     self._plot_size = 0
@@ -1382,7 +1392,12 @@ class PlotRenderer:
       )
 
   def draw(self, rect: rl.Rectangle, font) -> None:
-    show_plot_mode = ui_state.show_plot_mode
+    # ShowPlotMode 파일 읽기는 5초 TTL로 제한
+    now = time.monotonic()
+    if now - self._plot_params_time >= 5.0:
+      self._plot_params_time = now
+      self._plot_mode_cached = ui_state.params.get_int('ShowPlotMode')
+    show_plot_mode = self._plot_mode_cached
     if show_plot_mode == 0:
       return
     try:

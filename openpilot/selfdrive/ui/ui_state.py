@@ -96,13 +96,6 @@ class UIState:
     self.show_brightness_ratio: float = 1.0
     self.show_model_view: int = 0
 
-    # Params는 디스크 파일 읽기라 매 프레임 접근 금지. update_params(5초 주기)에서만 읽고
-    # 렌더러들은 params_refresh_count 변화를 보고 자기 캐시를 갱신한다.
-    self.params_refresh_count: int = 0
-    self._record_audio_param: bool = False
-    self.show_device_state: int = 0
-    self.show_plot_mode: int = 0
-
     self.update_params()
 
   def add_offroad_transition_callback(self, callback: Callable[[], None]):
@@ -155,7 +148,10 @@ class UIState:
     self.started = self.sm["deviceState"].started and self.ignition
 
     # Update recording audio state
-    self.recording_audio = self._record_audio_param and self.started
+    self.recording_audio = self.params.get_bool("RecordAudio") and self.started
+
+    self.is_metric = self.params.get_bool("IsMetric")
+    self.always_on_dm = self.params.get_bool("AlwaysOnDM")
 
   def _update_status(self) -> None:
     if self.started and self.sm.updated["selfdriveState"]:
@@ -203,14 +199,7 @@ class UIState:
     self.show_radar_info = self.params.get_int("ShowRadarInfo")
     self.show_brightness_ratio: float = self.params.get_int("ShowCustomBrightness") / 100.0
     self.show_model_view = self.params.get_int("ShowModelView")
-    self.show_device_state = self.params.get_int("ShowDeviceState")
-    self.show_plot_mode = self.params.get_int("ShowPlotMode")
 
-    self.is_metric = self.params.get_bool("IsMetric")
-    self.always_on_dm = self.params.get_bool("AlwaysOnDM")
-    self._record_audio_param = self.params.get_bool("RecordAudio")
-
-    self.params_refresh_count += 1
     self._param_update_time = time.monotonic()
 
 

@@ -1,6 +1,7 @@
 import math
 import pyray as rl
 from openpilot.system.ui.lib.application import gui_app, FontWeight
+from openpilot.system.ui.lib import text_measure as _text_measure
 from openpilot.system.ui.lib.text_measure import measure_text_cached
 
 
@@ -60,6 +61,11 @@ def draw_text_ui_style(text: str,
                        y_offset: float = 6.0) -> None:
   if not text:
     return
+
+  # 이 함수는 매 프레임 값이 바뀌는 문자열(디버그/속도 등)을 그려서 측정 캐시를 무한히 키운다.
+  # upstream text_measure.py를 수정하지 않기 위해 carrot 전용인 여기서 캐시 크기를 관리한다.
+  if len(_text_measure._cache) > 8192:
+    _text_measure._cache.clear()
 
   if font is None:
     font = gui_app.font(FontWeight.DISPLAY)
