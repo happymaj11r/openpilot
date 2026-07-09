@@ -161,6 +161,7 @@ class HudRenderer(Widget):
 
     self._gap_cache = 8
     self._gap_cache_time = 0.0
+    self._device_info_loaded = False
 
   def _update_state(self) -> None:
     """Update HUD state based on car state and controls state."""
@@ -798,7 +799,10 @@ class HudRenderer(Widget):
     if show_device_state <= 0:
       return
 
-    self._update_device_info()
+    # deviceState/peripheralState는 2Hz — 갱신된 프레임에만 capnp 리스트 순회 수행
+    if ui_state.sm.updated["deviceState"] or not self._device_info_loaded:
+      self._update_device_info()
+      self._device_info_loaded = True
 
     dx = bx - 35
     dy = by - 200

@@ -90,6 +90,9 @@ UNIFORM_FLOAT = rl.ShaderUniformDataType.SHADER_UNIFORM_FLOAT
 UNIFORM_VEC2 = rl.ShaderUniformDataType.SHADER_UNIFORM_VEC2
 UNIFORM_VEC4 = rl.ShaderUniformDataType.SHADER_UNIFORM_VEC4
 
+# ffi 직접 전달이 실패하는 환경이면 자동으로 리스트 변환 경로로 폴백
+_use_ffi_strip = True
+
 
 class ShaderState:
   _instance: Any = None
@@ -186,7 +189,7 @@ def _configure_shader_color(state: ShaderState, color: Optional[rl.Color],
     rl.set_shader_value(state.shader, state.locations['fillColor'], state.fill_color_ptr, UNIFORM_VEC4)
 
 
-def triangulate(pts: np.ndarray) -> list[tuple[float, float]]:
+def triangulate(pts: np.ndarray) -> np.ndarray:
   """Only supports simple polygons with two chains (ribbon)."""
 
   # TODO: consider deduping close screenspace points
@@ -195,12 +198,11 @@ def triangulate(pts: np.ndarray) -> list[tuple[float, float]]:
   if len(pts) % 2 != 0:
     pts = pts[:-1]
 
-  tri_strip = []
-  for i in range(len(pts) // 2):
-    tri_strip.append(pts[i])
-    tri_strip.append(pts[-i - 1])
-
-  return cast(list, np.array(tri_strip).tolist())
+  half = len(pts) // 2
+  tri_strip = np.empty((half * 2, 2), dtype=np.float32)
+  tri_strip[0::2] = pts[:half]
+  tri_strip[1::2] = pts[::-1][:half]
+  return tri_strip
 
 
 def draw_polygon(origin_rect: rl.Rectangle, points: np.ndarray,
@@ -228,8 +230,17 @@ def draw_polygon(origin_rect: rl.Rectangle, points: np.ndarray,
   tri_strip = triangulate(pts)
 
   # Draw strip, color here doesn't matter
+  # float32 (N,2) 배열은 Vector2[]와 메모리 배치가 같아 포인트별 파이썬→C 변환 없이 바로 전달
+  global _use_ffi_strip
   rl.begin_shader_mode(state.shader)
-  rl.draw_triangle_strip(tri_strip, len(tri_strip), rl.WHITE)
+  if _use_ffi_strip:
+    try:
+      buf = rl.ffi.from_buffer(tri_strip)
+      rl.draw_triangle_strip(rl.ffi.cast("Vector2 *", buf), tri_strip.shape[0], rl.WHITE)
+    except Exception:
+      _use_ffi_strip = False
+  if not _use_ffi_strip:
+    rl.draw_triangle_strip(cast(list, tri_strip.tolist()), tri_strip.shape[0], rl.WHITE)
   rl.end_shader_mode()
 
 
