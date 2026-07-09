@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
 from openpilot.selfdrive.locationd.calibrationd import HEIGHT_INIT
+from openpilot.selfdrive.ui.onroad.carrot_draw import draw_polygon_fast
 from openpilot.selfdrive.ui.onroad.carrot_perf import MODEL_PERF
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app, FontWeight
@@ -139,9 +140,12 @@ class ModelRenderer(Widget):
       if path_x_array.size == 0:
         return
 
-      self._update_model(lead_one, path_x_array)
-      if render_lead_indicator:
-        self._update_leads(radar_state, path_x_array)
+      if self._carrot_use_upstream_model_draw:
+        # upstream 투영 결과(projected_points/_exp_gradient/_lead_vehicles)는
+        # 주석 처리된 upstream 드로잉 전용이라 carrot 화면에서는 계산할 필요 없음
+        self._update_model(lead_one, path_x_array)
+        if render_lead_indicator:
+          self._update_leads(radar_state, path_x_array)
       self._transform_dirty = False
 
     # Draw elements
@@ -544,6 +548,7 @@ class ModelRenderer(Widget):
     self._carrot_lane_vertices_double = np.empty((0, 2), dtype=np.float32)
     self._carrot_road_vertices: list[np.ndarray] = []
     self._carrot_bs_geom_rev = -1          # 블라인드스팟 장벽 캐시 리비전
+    self._carrot_use_upstream_model_draw = False  # upstream _draw_path/_draw_lane_lines 미사용 → 그 입력 계산도 생략
 
 
   def _refresh_carrot_params(self):
@@ -707,7 +712,7 @@ class ModelRenderer(Widget):
 
   def _draw_quad_fill_carrot(self, p0, p1, p2, p3, color: rl.Color):
     pts = np.array([p0, p1, p2, p3], dtype=np.float32)
-    draw_polygon(self._rect, pts, color)
+    draw_polygon_fast(self._rect, pts, color)
 
   def _draw_two_quads_from_6pts_carrot(self, x, y, fill_color: rl.Color, brake_valid: bool, color_idx: int):
     pts = np.array(list(zip(x, y)), dtype=np.float32)
@@ -717,8 +722,8 @@ class ModelRenderer(Widget):
     left_pts = np.array([pts[0], pts[1], pts[2], pts[5]], dtype=np.float32)
     right_pts = np.array([pts[5], pts[2], pts[3], pts[4]], dtype=np.float32)
 
-    draw_polygon(self._rect, left_pts, fill_color)
-    draw_polygon(self._rect, right_pts, fill_color)
+    draw_polygon_fast(self._rect, left_pts, fill_color)
+    draw_polygon_fast(self._rect, right_pts, fill_color)
 
     if color_idx >= 10 or brake_valid:
       self._draw_polygon_outline_carrot(
@@ -744,7 +749,7 @@ class ModelRenderer(Widget):
     if pts.shape[0] < 3:
       return
 
-    draw_polygon(self._rect, pts, fill_color)
+    draw_polygon_fast(self._rect, pts, fill_color)
 
     if color_idx >= 10 or brake_valid:
       self._draw_polygon_outline_carrot(
@@ -970,8 +975,10 @@ class ModelRenderer(Widget):
     if self._lane_lines[0].raw_points.shape[0] == 0:
       return
 
+    double_needed = left_lane_line % 10 == 4
+
     # 지오메트리는 모델 갱신/투영행렬 변경 시에만 재계산, 그 외 프레임은 캐시로 드로잉만
-    lane_key = (self._carrot_geom_rev, left_lane_line >= 20, self._carrot_show_lane_info > 1)
+    lane_key = (self._carrot_geom_rev, left_lane_line >= 20, self._carrot_show_lane_info > 1, double_needed)
     if lane_key != self._carrot_lane_geom_key:
       self._carrot_lane_geom_key = lane_key
 
@@ -983,13 +990,19 @@ class ModelRenderer(Widget):
       lane_vertices_double = np.empty((0, 2), dtype=np.float32)
 
       for i in range(4):
+        # 확률이 낮은 차선은 alpha=0으로 어차피 보이지 않음 — 투영/드로우 모두 생략
+        if self._lane_line_probs[i] <= 0.3:
+          lane_vertices.append(np.empty((0, 2), dtype=np.float32))
+          continue
+
         line_width = 0.025
         if i == 1 and left_lane_line >= 20:
           line_width = 0.05
         pts = self._map_line_to_polygon(self._lane_lines[i].raw_points, line_width, 0.0, max_idx, max_distance)
         lane_vertices.append(pts)
 
-        if i == 1:
+        # 이중 차선 표시는 실제로 그릴 때(double_needed)만 생성
+        if i == 1 and double_needed:
           lane_vertices_double = self._map_line_to_polygon(
             self._lane_lines[i].raw_points,
             line_width,
@@ -1029,12 +1042,12 @@ class ModelRenderer(Widget):
       else:
         color = rl.Color(255, 255, 255, alpha)
 
-      draw_polygon(self._rect, lane_vertices[i], color)
+      draw_polygon_fast(self._rect, lane_vertices[i], color)
       if stroke > 0.0:
         self._draw_polygon_outline_carrot(lane_vertices[i], color, stroke)
 
       if i == 1 and (left_lane_line % 10 == 4) and lane_vertices_double.size != 0:
-        draw_polygon(self._rect, lane_vertices_double, color)
+        draw_polygon_fast(self._rect, lane_vertices_double, color)
         if stroke > 0.0:
           self._draw_polygon_outline_carrot(lane_vertices_double, color, stroke)
 
@@ -1044,7 +1057,7 @@ class ModelRenderer(Widget):
           continue
         temp_f = float(np.clip(road_edge_stds[i] / 2.0, 0.0, 1.0))
         color = rl.Color(int((1.0 - temp_f) * 255.0), 0, int(temp_f * 255.0), 255)
-        draw_polygon(self._rect, road_vertices[i], color)
+        draw_polygon_fast(self._rect, road_vertices[i], color)
 
 
 
@@ -1677,7 +1690,7 @@ class ModelRenderer(Widget):
     show_path_mode = self._carrot_show_path_mode
 
     if show_path_mode == 0:
-      draw_polygon(self._rect, self._path.projected_points, self._carrot_colors[show_path_color % 10])
+      draw_polygon_fast(self._rect, self._path.projected_points, self._carrot_colors[show_path_color % 10])
       if show_path_color >= 10 or brake_valid:
         self._draw_polygon_outline_carrot(
           self._path.projected_points,
