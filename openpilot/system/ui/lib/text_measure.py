@@ -32,5 +32,8 @@ def measure_text_cached(font: rl.Font, text: str, font_size: int, spacing: float
     if result.y == 0:
       result.y = font_size * FONT_SCALE
 
+  # 매 프레임 바뀌는 디버그 문자열 때문에 캐시가 무한히 자라는 것 방지 (gc 꺼진 프로세스라 특히 중요)
+  if len(_cache) > 8192:
+    _cache.clear()
   _cache[key] = result
   return result

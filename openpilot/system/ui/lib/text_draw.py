@@ -67,7 +67,8 @@ def draw_text_ui_style(text: str,
   draw_x, draw_y, _ = get_text_draw_pos(font, text, x, y, font_size, align, y_offset)
 
   if border_width > 0.0:
-    for deg in range(0, 360, 45):
+    # 외곽선은 대각 4방향으로 충분 — 8방향 대비 텍스트 드로우 콜을 절반으로 줄임 (온로드 프레임당 수백 콜)
+    for deg in range(45, 360, 90):
       rad = math.radians(deg)
       ox = border_width * math.cos(rad)
       oy = border_width * math.sin(rad)
