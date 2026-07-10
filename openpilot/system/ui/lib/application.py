@@ -349,6 +349,28 @@ class GuiApplication:
       self._render_texture = rl.load_render_texture(self._width, self._height)
       rl.set_texture_filter(self._render_texture.texture, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)
 
+  @staticmethod
+  def _demote_record_sched():
+    """녹화 파이프라인(ffmpeg 자식 프로세스/라이터 스레드)을 일반 스케줄러·비RT 코어로 강등.
+
+    UI는 core5 + SCHED_FIFO 53(RT)이라 자식/스레드가 이를 그대로 상속하는데,
+    녹화용 ffmpeg가 FIFO 53으로 core5를 점유하면 같은 코어의 plannerd/radard(FIFO 51)가
+    굶어 radarState/longitudinalPlan 발행이 끊기고 commIssue → soft disable이 발생한다.
+    """
+    try:
+      os.sched_setscheduler(0, os.SCHED_OTHER, os.sched_param(0))
+    except OSError:
+      pass
+    try:
+      os.sched_setaffinity(0, {0, 1, 2, 3})
+    except OSError:
+      pass
+
+  def _record_writer_thread(self):
+    # 스레드도 UI의 RT 스케줄링을 상속하므로 시작하자마자 강등한 뒤 upstream 루프 사용
+    self._demote_record_sched()
+    self._ffmpeg_writer_thread()
+
   def _init_ffmpeg(self, out_path: Path):
     self.close_ffmpeg()
 
@@ -386,10 +408,10 @@ class GuiApplication:
       str(out_path),
     ]
 
-    self._ffmpeg_proc = subprocess.Popen(ffmpeg_args, stdin=subprocess.PIPE)
+    self._ffmpeg_proc = subprocess.Popen(ffmpeg_args, stdin=subprocess.PIPE, preexec_fn=self._demote_record_sched)
     self._ffmpeg_queue = queue.Queue(maxsize=8) # 60 -> 8, 메모리 사용량 줄이기 위해 버퍼 크기 감소
     self._ffmpeg_stop_event = threading.Event()
-    self._ffmpeg_thread = threading.Thread(target=self._ffmpeg_writer_thread, daemon=True)
+    self._ffmpeg_thread = threading.Thread(target=self._record_writer_thread, daemon=True)
     self._ffmpeg_thread.start()
 
   def close_ffmpeg(self):
