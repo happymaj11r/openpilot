@@ -10,6 +10,7 @@ from openpilot.selfdrive.ui.onroad.augmented_road_view import AugmentedRoadView
 from openpilot.selfdrive.ui.ui_state import device, ui_state
 from openpilot.system.ui.widgets import Widget
 from openpilot.selfdrive.ui.layouts.onboarding import OnboardingWindow
+from openpilot.selfdrive.ui.carrot_params_watch import ParamsRefreshGate
 
 
 class MainState(IntEnum):
@@ -46,7 +47,7 @@ class MainLayout(Widget):
     # carrot_man
     self._last_carrot_cmd_idx = -1
     self._screen_record_param = False
-    self._screen_record_param_time = 0.0
+    self._screen_record_gate = ParamsRefreshGate()
 
   def _sync_screen_record_state(self, requested: bool) -> bool:
     recording = gui_app.is_recording()
@@ -57,10 +58,8 @@ class MainLayout(Widget):
     return recording
 
   def _handle_carrot_record_cmd(self, sm) -> bool:
-    # 파라미터 파일 읽기는 1초에 한 번으로 제한 (carrotMan 명령 경로는 매 프레임 유지)
-    now = time.monotonic()
-    if now - self._screen_record_param_time >= 1.0:
-      self._screen_record_param_time = now
+    # 파라미터가 바뀐 경우에만 파일을 다시 읽는다 (carrotMan 명령 경로는 매 프레임 유지)
+    if self._screen_record_gate.should_refresh(time.monotonic()):
       self._screen_record_param = ui_state.params.get_bool("ScreenRecord")
     screen_record = self._screen_record_param
     if screen_record:

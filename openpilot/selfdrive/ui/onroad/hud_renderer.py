@@ -3,6 +3,7 @@ from collections import deque
 import pyray as rl
 from dataclasses import dataclass
 from openpilot.common.constants import CV
+from openpilot.selfdrive.ui.carrot_params_watch import ParamsRefreshGate
 from openpilot.selfdrive.ui.onroad.exp_button import ExpButton
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.system.ui.lib.application import gui_app, FontWeight
@@ -160,17 +161,15 @@ class HudRenderer(Widget):
     self._plot_renderer = None
 
     self._gap_cache = 8
-    self._gap_cache_time = 0.0
+    self._gap_gate = ParamsRefreshGate()
     self._device_info_loaded = False
     self._show_device_state = 0
-    self._hud_params_time = 0.0
+    self._hud_params_gate = ParamsRefreshGate()
 
   def _update_state(self) -> None:
     """Update HUD state based on car state and controls state."""
-    # 표시 옵션 Params는 파일 I/O라 5초 TTL로만 다시 읽는다
-    now = time.monotonic()
-    if now - self._hud_params_time >= 5.0:
-      self._hud_params_time = now
+    # 표시 옵션 Params는 설정이 실제로 바뀐 경우에만 다시 읽는다 (디렉토리 mtime 감지)
+    if self._hud_params_gate.should_refresh(time.monotonic()):
       self._show_device_state = ui_state.params.get_int("ShowDeviceState")
 
     sm = ui_state.sm
@@ -362,10 +361,8 @@ class HudRenderer(Widget):
     return "M"
 
   def _get_cruise_gap(self) -> int:
-    # 갭 버튼 반응성은 유지하되 파일 읽기는 1초에 한 번으로 제한
-    now = time.monotonic()
-    if now - self._gap_cache_time >= 1.0:
-      self._gap_cache_time = now
+    # 갭 버튼으로 파라미터가 바뀐 경우에만 파일을 다시 읽는다
+    if self._gap_gate.should_refresh(time.monotonic()):
       try:
         self._gap_cache = ui_state.params.get_int("LongitudinalPersonality") + 1
       except Exception:
@@ -1205,7 +1202,7 @@ class PlotRenderer:
     self._plot_dx = 2.0
     self._show_plot_mode_prev = -1
     self._plot_mode_cached = 0
-    self._plot_params_time = 0.0
+    self._plot_params_gate = ParamsRefreshGate()
 
   def _clear(self):
     self._plot_size = 0
@@ -1392,10 +1389,8 @@ class PlotRenderer:
       )
 
   def draw(self, rect: rl.Rectangle, font) -> None:
-    # ShowPlotMode 파일 읽기는 5초 TTL로 제한
-    now = time.monotonic()
-    if now - self._plot_params_time >= 5.0:
-      self._plot_params_time = now
+    # ShowPlotMode는 설정이 실제로 바뀐 경우에만 다시 읽는다
+    if self._plot_params_gate.should_refresh(time.monotonic()):
       self._plot_mode_cached = ui_state.params.get_int('ShowPlotMode')
     show_plot_mode = self._plot_mode_cached
     if show_plot_mode == 0:

@@ -4,6 +4,7 @@ import pyray as rl
 from openpilot.cereal import log, messaging
 from msgq.visionipc import VisionStreamType
 from openpilot.selfdrive.ui import UI_BORDER_SIZE
+from openpilot.selfdrive.ui.carrot_params_watch import ParamsRefreshGate
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.selfdrive.ui.onroad.alert_renderer import AlertRenderer
 from openpilot.selfdrive.ui.onroad.driver_state import DriverStateRenderer
@@ -53,8 +54,8 @@ class AugmentedRoadView(CameraView):
     # debug
     self._pm = messaging.PubMaster(['uiDebug'])
 
-    # 테두리 텍스트용 Params 캐시 (5초 TTL로 재읽기)
-    self._border_params_time = 0.0
+    # 테두리 텍스트용 Params 캐시 (설정 변경 시에만 재읽기)
+    self._border_params_gate = ParamsRefreshGate()
     self._border_top_left = ""
     self._border_bottom_left = ""
     self._border_bottom_right = ""
@@ -382,10 +383,8 @@ class AugmentedRoadView(CameraView):
     top_right = ""
     bottom = ""
 
-    # 차량명/브랜치명 등은 주행 중 사실상 불변 — 5초 TTL로만 파일에서 읽는다
-    now = time.monotonic()
-    if now - self._border_params_time >= 5.0:
-      self._border_params_time = now
+    # 차량명/브랜치명 등은 주행 중 사실상 불변 — 설정이 바뀐 경우에만 파일에서 읽는다
+    if self._border_params_gate.should_refresh(time.monotonic()):
 
       car_name = ui_state.params.get("CarName") or ""
       if ui_state.params.get_int("HyundaiCameraSCC") > 0:

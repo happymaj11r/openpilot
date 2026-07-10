@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
 from openpilot.selfdrive.locationd.calibrationd import HEIGHT_INIT
+from openpilot.selfdrive.ui.carrot_params_watch import ParamsRefreshGate
 from openpilot.selfdrive.ui.onroad.carrot_draw import draw_polygon_fast
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app, FontWeight
@@ -533,7 +534,7 @@ class ModelRenderer(Widget):
     ]
 
     # 프레임 단위 재계산 방지용 캐시 상태 (upstream 코드 비수정 원칙 — 상태와 감지 로직 모두 carrot 전용)
-    self._carrot_params_time = -10.0       # Params 재읽기 TTL 기준 시각 (rl.get_time, 5초)
+    self._carrot_params_gate = ParamsRefreshGate()  # 설정 변경 시에만 Params 재읽기
     self._carrot_geom_rev = 0              # modelV2 갱신/투영행렬 변경 시 증가
     self._carrot_transform_ref: np.ndarray | None = None  # set_transform이 만든 배열 identity 추적
     self._carrot_transform_flat = [0.0] * 9  # 스칼라 투영용 평탄화 사본
@@ -1643,10 +1644,8 @@ class ModelRenderer(Widget):
   def _draw_path_carrot(self, sm):
     # carrot 드로잉 중 가장 먼저 실행되므로 여기서 프레임 상태(투영행렬/지오메트리 리비전)를 갱신
     self._refresh_carrot_frame_state(sm)
-    # Params는 파일 I/O라 5초 TTL로만 다시 읽는다
-    now = rl.get_time()
-    if now - self._carrot_params_time >= 5.0:
-      self._carrot_params_time = now
+    # Params 파일 읽기는 설정이 실제로 바뀐 경우에만 (디렉토리 mtime 감지)
+    if self._carrot_params_gate.should_refresh(rl.get_time()):
       self._refresh_carrot_params()
     path_ok = self._make_path_data_carrot(sm)
     if not path_ok:
