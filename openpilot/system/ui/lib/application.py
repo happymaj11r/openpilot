@@ -354,33 +354,38 @@ class GuiApplication:
       rl.set_texture_filter(self._render_texture.texture, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)
 
   @staticmethod
-  def _demote_record_sched():
-    """호출한 스레드를 일반 스케줄러·비RT 코어로 강등 (Linux 전용, 그 외 no-op).
+  def _demote_record_sched() -> bool:
+    """호출한 스레드를 일반 스케줄러·비RT 코어로 강등하고 실제 적용 여부를 돌려준다.
 
     UI는 core5 + SCHED_FIFO 53(RT)이라 스레드가 이를 그대로 상속하는데, 녹화 파이프라인이
     FIFO 53으로 core5를 점유하면 같은 코어의 plannerd/radard(FIFO 51)가 굶어
     radarState/longitudinalPlan 발행이 끊기고 commIssue → soft disable이 발생한다.
+    비Linux는 RT 상속 자체가 없으므로 항상 성공으로 본다.
     """
-    if not hasattr(os, "sched_setscheduler"):
-      return
+    if sys.platform != "linux":
+      return True
     try:
       os.sched_setscheduler(0, os.SCHED_OTHER, os.sched_param(0))
-    except OSError:
-      pass
-    try:
       os.sched_setaffinity(0, {0, 1, 2, 3})
+      return (os.sched_getscheduler(0) == os.SCHED_OTHER
+              and not (os.sched_getaffinity(0) & {4, 5}))
     except OSError:
-      pass
+      return False
 
   def _record_writer_thread(self):
-    # 스레드도 UI의 RT 스케줄링을 상속하므로 시작하자마자 강등한 뒤 upstream 루프 사용
-    self._demote_record_sched()
+    # 스레드도 UI의 RT 스케줄링을 상속하므로 시작하자마자 강등 — 실패하면 FIFO 53으로
+    # 프레임을 쓰게 되므로 인코더까지 함께 중단한다 (fail-closed)
+    proc = self._ffmpeg_proc
+    if not self._demote_record_sched():
+      print("[REC] writer demotion FAILED, killing encoder to protect driving processes")
+      if proc is not None:
+        proc.kill()
+      return
 
     # ffmpeg 강등 검증 (fail-open 방지): chrt/taskset은 exec 체인에서 수 ms 내에 적용되므로
     # 잠시 기다렸다가 실제 스케줄러/코어를 확인하고, RT나 core4/5가 남아 있으면 즉시 중단한다.
     # 이 스레드는 이미 비RT라 sleep이 렌더 루프를 막지 않는다.
-    proc = self._ffmpeg_proc
-    if proc is not None and hasattr(os, "sched_getscheduler"):
+    if proc is not None and sys.platform == "linux":
       time.sleep(0.1)
       try:
         if proc.poll() is None:
@@ -390,8 +395,13 @@ class GuiApplication:
             print("[REC] ffmpeg demotion verification FAILED, killing encoder to protect driving processes")
             proc.kill()
             return
-      except OSError:
-        pass  # 프로세스가 이미 종료된 경우 등 — 죽은 인코더는 렌더 루프가 감지해 녹화를 멈춘다
+      except OSError as e:
+        # 살아 있는 인코더를 검증할 수 없으면 안전하지 않은 것으로 간주하고 중단한다.
+        # 이미 죽은 경우(ESRCH 등)는 렌더 루프가 감지해 녹화를 멈춘다.
+        if proc.poll() is None:
+          print(f"[REC] ffmpeg verification ERROR: {e!r}; killing encoder")
+          proc.kill()
+        return
 
     self._ffmpeg_writer_thread()
 
