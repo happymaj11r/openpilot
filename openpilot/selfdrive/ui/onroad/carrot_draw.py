@@ -3,6 +3,7 @@ from typing import Optional
 import numpy as np
 import pyray as rl
 
+from openpilot.common.swaglog import cloudlog
 from openpilot.system.ui.lib.shader_polygon import Gradient, ShaderState, _configure_shader_color, draw_polygon
 
 _use_ffi = True
@@ -45,6 +46,8 @@ def draw_polygon_fast(origin_rect: rl.Rectangle, points: np.ndarray,
       rl.draw_triangle_strip(rl.ffi.cast("Vector2 *", buf), strip.shape[0], rl.WHITE)
     finally:
       rl.end_shader_mode()
-  except Exception:
+  except Exception as e:
     _use_ffi = False
+    # 폴백은 세션당 1회만 발동하므로 로그도 1회 — rlog에서 CARROTDRAW로 검색해 확인
+    cloudlog.warning(f"CARROTDRAW ffi fast path disabled, falling back to draw_polygon: {e!r}")
     draw_polygon(origin_rect, points, color, gradient)
