@@ -2,7 +2,6 @@ import time
 import numpy as np
 import pyray as rl
 from openpilot.cereal import log, messaging
-from openpilot.common.swaglog import cloudlog
 from msgq.visionipc import VisionStreamType
 from openpilot.selfdrive.ui import UI_BORDER_SIZE
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
@@ -61,13 +60,6 @@ class AugmentedRoadView(CameraView):
     self._border_bottom_right = ""
     self._border_custom_sr = 0.0
 
-    # 구간별 렌더 시간 계측 (UIPERF) — 느린 프레임의 원인 구간 특정용.
-    # 오버헤드는 프레임당 time.monotonic() 5회 수준이라 무시 가능.
-    self._perf_totals: list[float] = []
-    self._perf_sums = [0.0] * 5        # cam, model, hud, alertdm, border
-    self._perf_slow_sums = [0.0] * 5   # total>30ms인 프레임만 누적
-    self._perf_slow_count = 0
-
   def _render(self, rect):
     # Only render when system is started to avoid invalid data access
     start_draw = time.monotonic()
@@ -98,16 +90,12 @@ class AugmentedRoadView(CameraView):
 
     # Render the base camera view
     super()._render(rect)
-    t_cam = time.monotonic()
 
     # Draw all UI overlays
     self.model_renderer.render(self._content_rect)
-    t_model = time.monotonic()
     self._hud_renderer.render(self._content_rect)
-    t_hud = time.monotonic()
     self.alert_renderer.render(self._content_rect)
     self.driver_state_renderer.render(self._content_rect)
-    t_alert = time.monotonic()
 
     # Custom UI extension point - add custom overlays here
     # Use self._content_rect for positioning within camera bounds
@@ -117,42 +105,13 @@ class AugmentedRoadView(CameraView):
 
     # Draw colored border based on driving state
     self._draw_border_carrot(rect)
-    t_border = time.monotonic()
 
-    total = t_border - start_draw
-    self._perf_tick(
-      (t_cam - start_draw, t_model - t_cam, t_hud - t_model, t_alert - t_hud, t_border - t_alert), total)
+    total = time.monotonic() - start_draw
 
     # publish uiDebug
     msg = messaging.new_message('uiDebug')
     msg.uiDebug.drawTimeMillis = total * 1000
     self._pm.send('uiDebug', msg)
-
-  def _perf_tick(self, sections: tuple, total: float) -> None:
-    # 약 10초(200프레임)마다 구간별 평균과 느린 프레임(>30ms)의 구간별 평균을 rlog에 남긴다
-    self._perf_totals.append(total)
-    for i, s in enumerate(sections):
-      self._perf_sums[i] += s
-    if total > 0.030:
-      self._perf_slow_count += 1
-      for i, s in enumerate(sections):
-        self._perf_slow_sums[i] += s
-
-    n = len(self._perf_totals)
-    if n >= 200:
-      names = ("cam", "model", "hud", "alertdm", "border")
-      totals = sorted(self._perf_totals)
-      avg = " ".join(f"{nm}={self._perf_sums[i] / n * 1000:.1f}" for i, nm in enumerate(names))
-      slow = ""
-      if self._perf_slow_count > 0:
-        slow_avg = " ".join(f"{nm}={self._perf_slow_sums[i] / self._perf_slow_count * 1000:.1f}" for i, nm in enumerate(names))
-        slow = f" slow_n={self._perf_slow_count} slow_avg_ms[{slow_avg}]"
-      cloudlog.warning(
-        f"UIPERF n={n} avg_ms[{avg}] total_p50={totals[n // 2] * 1000:.1f} total_p95={totals[int(n * 0.95)] * 1000:.1f}{slow}")
-      self._perf_totals = []
-      self._perf_sums = [0.0] * 5
-      self._perf_slow_sums = [0.0] * 5
-      self._perf_slow_count = 0
 
   def _handle_mouse_press(self, _):
     if not self._hud_renderer.user_interacting() and self._click_callback is not None:

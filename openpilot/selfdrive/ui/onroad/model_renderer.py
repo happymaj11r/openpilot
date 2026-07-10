@@ -8,7 +8,6 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
 from openpilot.selfdrive.locationd.calibrationd import HEIGHT_INIT
 from openpilot.selfdrive.ui.onroad.carrot_draw import draw_polygon_fast
-from openpilot.selfdrive.ui.onroad.carrot_perf import MODEL_PERF
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.text_draw import draw_text_ui_style
@@ -154,15 +153,10 @@ class ModelRenderer(Widget):
 
     #if render_lead_indicator and radar_state:
     #  self._draw_lead_indicator()
-    MODEL_PERF.begin()
     self._draw_path_carrot(sm)
     self._draw_lane_lines_carrot(sm)
-    MODEL_PERF.mark('lanes')
     self._draw_blind_spot_carrot(sm)
-    MODEL_PERF.mark('blind')
     self._draw_radar_info_carrot(sm)
-    MODEL_PERF.mark('radar')
-    MODEL_PERF.frame_done()
 
   def _update_raw_points(self, model):
     """Update raw 3D points from model data"""
@@ -1655,12 +1649,10 @@ class ModelRenderer(Widget):
       self._carrot_params_time = now
       self._refresh_carrot_params()
     path_ok = self._make_path_data_carrot(sm)
-    MODEL_PERF.mark('path_build')
     if not path_ok:
       return
 
     self._update_path_end_carrot(sm)
-    MODEL_PERF.mark('path_end')
 
     car_state = sm['carState']
     temp = int(car_state.useLaneLineSpeed)
@@ -1703,7 +1695,5 @@ class ModelRenderer(Widget):
       self._draw_complex_path_carrot(show_path_color, brake_valid)
     else:
       self._draw_animated_path_carrot(sm, show_path_mode, show_path_color, brake_valid)
-    MODEL_PERF.mark('path_draw')
 
     self._draw_path_end_overlay_carrot()
-    MODEL_PERF.mark('path_overlay')

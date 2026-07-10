@@ -3,7 +3,6 @@ from collections import deque
 import pyray as rl
 from dataclasses import dataclass
 from openpilot.common.constants import CV
-from openpilot.selfdrive.ui.onroad.carrot_perf import HUD_PERF
 from openpilot.selfdrive.ui.onroad.exp_button import ExpButton
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.system.ui.lib.application import gui_app, FontWeight
@@ -204,7 +203,6 @@ class HudRenderer(Widget):
 
   def _render(self, rect: rl.Rectangle) -> None:
     """Render HUD elements to the screen."""
-    HUD_PERF.begin()
     # Draw the header background
     rl.draw_rectangle_gradient_v(
       int(rect.x),
@@ -223,17 +221,12 @@ class HudRenderer(Widget):
     button_x = rect.x + rect.width - UI_CONFIG.border_size - UI_CONFIG.button_size
     button_y = rect.y + UI_CONFIG.border_size
     self._exp_button.render(rl.Rectangle(button_x, button_y, UI_CONFIG.button_size, UI_CONFIG.button_size))
-    HUD_PERF.mark('button')
 
     if self._plot_renderer is None:
       self._plot_renderer = PlotRenderer()
     self._plot_renderer.draw(rect, self._font_display)
-    HUD_PERF.mark('plot')
     self._draw_date_time(rect)
-    HUD_PERF.mark('datetime')
     self._draw_tpms_top_right(rect)
-    HUD_PERF.mark('tpms')
-    HUD_PERF.frame_done()
 
   def user_interacting(self) -> bool:
     return self._exp_button.is_pressed
@@ -1188,17 +1181,11 @@ class HudRenderer(Widget):
 
     self._draw_carrot_main_background(bx, by)
     self._draw_carrot_traffic_light(bx, by)
-    HUD_PERF.mark('bg')
     self._draw_carrot_speed_panel(bx, by)
-    HUD_PERF.mark('speed')
     self._draw_carrot_lower_status(bx, by)
-    HUD_PERF.mark('status')
     self._draw_carrot_speed_limit_box(bx, by)
-    HUD_PERF.mark('limit')
     self._draw_carrot_device_state(bx, by)
-    HUD_PERF.mark('device')
     self._draw_turn_info_hud(rect)
-    HUD_PERF.mark('turninfo')
   
 
 
