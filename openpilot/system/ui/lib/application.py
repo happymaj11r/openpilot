@@ -322,7 +322,11 @@ class GuiApplication:
       return
 
     out_path = self._new_record_path()
-    self._init_ffmpeg(out_path)
+    if not self._init_ffmpeg(out_path):
+      # 강등 런처 없이 ffmpeg를 띄우면 UI의 RT 스케줄링을 상속해 주행 프로세스를
+      # 굶기므로(2026-07-10 인게이지 해제 사고) 녹화를 시작하지 않는다 (fail-closed)
+      print("[REC] failed to start encoder, recording aborted")
+      return
 
     self._record_enabled = True
     self._record_t0 = time.monotonic()
@@ -351,12 +355,14 @@ class GuiApplication:
 
   @staticmethod
   def _demote_record_sched():
-    """녹화 파이프라인(ffmpeg 자식 프로세스/라이터 스레드)을 일반 스케줄러·비RT 코어로 강등.
+    """호출한 스레드를 일반 스케줄러·비RT 코어로 강등 (Linux 전용, 그 외 no-op).
 
-    UI는 core5 + SCHED_FIFO 53(RT)이라 자식/스레드가 이를 그대로 상속하는데,
-    녹화용 ffmpeg가 FIFO 53으로 core5를 점유하면 같은 코어의 plannerd/radard(FIFO 51)가
-    굶어 radarState/longitudinalPlan 발행이 끊기고 commIssue → soft disable이 발생한다.
+    UI는 core5 + SCHED_FIFO 53(RT)이라 스레드가 이를 그대로 상속하는데, 녹화 파이프라인이
+    FIFO 53으로 core5를 점유하면 같은 코어의 plannerd/radard(FIFO 51)가 굶어
+    radarState/longitudinalPlan 발행이 끊기고 commIssue → soft disable이 발생한다.
     """
+    if not hasattr(os, "sched_setscheduler"):
+      return
     try:
       os.sched_setscheduler(0, os.SCHED_OTHER, os.sched_param(0))
     except OSError:
@@ -369,9 +375,27 @@ class GuiApplication:
   def _record_writer_thread(self):
     # 스레드도 UI의 RT 스케줄링을 상속하므로 시작하자마자 강등한 뒤 upstream 루프 사용
     self._demote_record_sched()
+
+    # ffmpeg 강등 검증 (fail-open 방지): chrt/taskset은 exec 체인에서 수 ms 내에 적용되므로
+    # 잠시 기다렸다가 실제 스케줄러/코어를 확인하고, RT나 core4/5가 남아 있으면 즉시 중단한다.
+    # 이 스레드는 이미 비RT라 sleep이 렌더 루프를 막지 않는다.
+    proc = self._ffmpeg_proc
+    if proc is not None and hasattr(os, "sched_getscheduler"):
+      time.sleep(0.1)
+      try:
+        if proc.poll() is None:
+          demoted = (os.sched_getscheduler(proc.pid) == os.SCHED_OTHER
+                     and not (os.sched_getaffinity(proc.pid) & {4, 5}))
+          if not demoted:
+            print("[REC] ffmpeg demotion verification FAILED, killing encoder to protect driving processes")
+            proc.kill()
+            return
+      except OSError:
+        pass  # 프로세스가 이미 종료된 경우 등 — 죽은 인코더는 렌더 루프가 감지해 녹화를 멈춘다
+
     self._ffmpeg_writer_thread()
 
-  def _init_ffmpeg(self, out_path: Path):
+  def _init_ffmpeg(self, out_path: Path) -> bool:
     self.close_ffmpeg()
 
     # 내부 튜닝(원하면 여기만 조절)
@@ -408,11 +432,23 @@ class GuiApplication:
       str(out_path),
     ]
 
-    self._ffmpeg_proc = subprocess.Popen(ffmpeg_args, stdin=subprocess.PIPE, preexec_fn=self._demote_record_sched)
+    if sys.platform == "linux":
+      # 자식 프로세스가 UI의 SCHED_FIFO 53/core5를 상속하지 않도록 검증된 런처로 강등해 실행.
+      # preexec_fn은 멀티스레드 프로세스에서 fork 후 데드락 위험이 있어 쓰지 않는다.
+      ffmpeg_args = ["chrt", "--other", "0", "taskset", "--cpu-list", "0-3", *ffmpeg_args]
+
+    try:
+      self._ffmpeg_proc = subprocess.Popen(ffmpeg_args, stdin=subprocess.PIPE)
+    except OSError as e:
+      # chrt/taskset 부재 등 — RT 상속 상태로 녹화하느니 시작하지 않는다
+      print(f"[REC] failed to launch encoder: {e!r}")
+      self._ffmpeg_proc = None
+      return False
     self._ffmpeg_queue = queue.Queue(maxsize=8) # 60 -> 8, 메모리 사용량 줄이기 위해 버퍼 크기 감소
     self._ffmpeg_stop_event = threading.Event()
     self._ffmpeg_thread = threading.Thread(target=self._record_writer_thread, daemon=True)
     self._ffmpeg_thread.start()
+    return True
 
   def close_ffmpeg(self):
     if self._ffmpeg_thread is not None:
@@ -917,7 +953,12 @@ class GuiApplication:
             rl.unload_image(image)
             
           if self._record_enabled:
-            if (time.monotonic() - self._record_t0) >= self._record_max_sec:
+            if self._ffmpeg_proc is None or self._ffmpeg_proc.poll() is not None:
+              # 인코더 사망(강등 검증 실패로 kill된 경우 포함) — 실제로는 기록되지
+              # 않는데 녹화 중인 것처럼 보이지 않도록 즉시 녹화를 멈춘다
+              print("[REC] encoder not running, stopping recording")
+              self.stop_recording()
+            elif (time.monotonic() - self._record_t0) >= self._record_max_sec:
               self.stop_recording()
               self.start_recording()
 
