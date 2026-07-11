@@ -50,28 +50,40 @@ class PlotSchedGate:
       return False
 
   @staticmethod
+  def _rollback_to_other() -> bool:
+    """SCHED_OTHER 복귀를 readback 검증 포함 최대 2회 시도한다."""
+    for _ in range(2):
+      try:
+        drop_realtime()
+        if os.sched_getscheduler(0) == os.SCHED_OTHER:
+          return True
+      except OSError:
+        continue
+    return False
+
+  @staticmethod
   def _restore() -> bool:
-    """FIFO 53 + core5 복구. 어느 단계든 실패하면 SCHED_OTHER로 롤백해
-    '복구 실패 = 확실히 비RT 상태'를 보장한다 (부분 성공으로 FIFO만 남는 것 금지)."""
+    """FIFO 53 + core5 복구. 실패하면 SCHED_OTHER 롤백을 시도한다.
+
+    affinity를 먼저(아직 SCHED_OTHER일 때), FIFO 승격을 마지막에 수행해 'False인데
+    FIFO 잔류' 같은 부분 성공을 막는다. 단, 커널이 롤백 syscall까지 거부하면
+    파이썬에서 비RT를 강제할 수단이 없다 — 그 경우에도 plot은 fail-closed로 잠기고
+    (재활성화는 _demote 검증 필요) 'FIFO 53 + plot off'는 UI의 평상시 상태와 같으므로
+    fail-stop 대신 update()가 실제 policy를 정확히 기록한다.
+    """
     if sys.platform != "linux" or PC:
       return True
     try:
-      # 아직 SCHED_OTHER인 상태에서 affinity 먼저 — FIFO 승격은 마지막 단계로 미뤄서
-      # affinity 실패가 'FIFO인데 False 반환' 같은 부분 성공을 만들지 못하게 한다
       os.sched_setaffinity(0, {UI_CORE})
       os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(Priority.CTRL_HIGH))
       ok = (os.sched_getscheduler(0) == os.SCHED_FIFO
             and os.sched_getparam(0).sched_priority == Priority.CTRL_HIGH
             and os.sched_getaffinity(0) == {UI_CORE})
-      if not ok:
-        drop_realtime()
-      return ok
     except OSError:
-      try:
-        drop_realtime()  # 부분 성공했을 가능성까지 롤백
-      except OSError:
-        cloudlog.exception("PLOTSCHED: failed to roll back UI to SCHED_OTHER")
-      return False
+      ok = False
+    if not ok:
+      PlotSchedGate._rollback_to_other()  # 부분 성공했을 가능성까지 롤백
+    return ok
 
   @staticmethod
   def _current_policy() -> int:
@@ -118,9 +130,13 @@ class PlotSchedGate:
       if self._restore():
         cloudlog.warning("PLOTSCHED: DebugPlot inactive, UI restored to SCHED_FIFO 53")
       else:
-        # 복구 실패는 안전 문제가 아니다(planner가 계속 UI를 선점 가능) — UI를 죽이지
-        # 않고 SCHED_OTHER로 유지(_restore가 롤백을 보장). 다음 전이에서 자연 재시도.
-        cloudlog.error(f"PLOTSCHED: UI RT restore FAILED (policy now {self._current_policy()}), staying SCHED_OTHER")
+        # 복구 실패는 안전 문제가 아니다(plot은 잠긴 상태, 재활성화는 _demote 검증
+        # 필요) — UI를 죽이지 않고 실제 policy를 확인해 정확히 기록한다.
+        policy = self._current_policy()
+        if policy == os.SCHED_OTHER:
+          cloudlog.error("PLOTSCHED: UI RT restore FAILED, staying SCHED_OTHER")
+        else:
+          cloudlog.critical(f"PLOTSCHED: UI RT restore FAILED and rollback FAILED (policy={policy}); plot remains disabled")
       self._demoted = False
 
     self._effective_mode = mode if (mode > 0 and self._demoted) else 0

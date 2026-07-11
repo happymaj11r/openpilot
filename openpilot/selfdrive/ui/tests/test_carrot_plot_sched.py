@@ -148,7 +148,8 @@ class TestRestoreAtomicity:
   """_restore는 부분 성공을 남기면 안 된다 — 실패 시 최종 상태는 반드시 SCHED_OTHER."""
 
   def _run_restore(self, monkeypatch, *, affinity_raises=False, sched_raises=False,
-                   verify_policy=None):
+                   verify_policy=None, verify_priority=None, verify_affinity=None,
+                   drop_fails=0):
     calls = {"order": [], "rollback": 0}
     monkeypatch.setattr(cps, "PC", False)
     state = {"policy": os.SCHED_OTHER, "prio": 0, "affinity": {UI_CORE}}
@@ -167,15 +168,23 @@ class TestRestoreAtomicity:
 
     def fake_drop():
       calls["rollback"] += 1
+      if calls["rollback"] <= drop_fails:
+        raise OSError("rollback refused")
       state["policy"], state["prio"] = os.SCHED_OTHER, 0
+
+    def fake_getscheduler(pid):
+      # 3중 검증에는 주입값(verify_policy)을, 롤백 readback에는 실제 상태를 돌려준다
+      if verify_policy is not None and state["policy"] != os.SCHED_OTHER:
+        return verify_policy
+      return state["policy"]
 
     monkeypatch.setattr(os, "sched_setaffinity", fake_setaffinity)
     monkeypatch.setattr(os, "sched_setscheduler", fake_setscheduler)
-    monkeypatch.setattr(os, "sched_getscheduler",
-                        lambda pid: state["policy"] if verify_policy is None else verify_policy)
+    monkeypatch.setattr(os, "sched_getscheduler", fake_getscheduler)
     monkeypatch.setattr(os, "sched_getparam",
-                        lambda pid: os.sched_param(state["prio"]))
-    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: state["affinity"])
+                        lambda pid: os.sched_param(state["prio"] if verify_priority is None else verify_priority))
+    monkeypatch.setattr(os, "sched_getaffinity",
+                        lambda pid: state["affinity"] if verify_affinity is None else set(verify_affinity))
     monkeypatch.setattr(cps, "drop_realtime", fake_drop)
     result = PlotSchedGate._restore()
     return result, calls, state
@@ -207,3 +216,56 @@ class TestRestoreAtomicity:
     assert result is False
     assert calls["rollback"] == 1
     assert state["policy"] == os.SCHED_OTHER
+
+  def test_priority_mismatch_rolls_back(self, monkeypatch):
+    result, calls, state = self._run_restore(monkeypatch, verify_priority=1)
+    assert result is False
+    assert calls["rollback"] >= 1
+    assert state["policy"] == os.SCHED_OTHER
+
+  def test_affinity_mismatch_rolls_back(self, monkeypatch):
+    result, calls, state = self._run_restore(monkeypatch, verify_affinity={0, UI_CORE})
+    assert result is False
+    assert calls["rollback"] >= 1
+    assert state["policy"] == os.SCHED_OTHER
+
+  def test_rollback_retry_succeeds_on_second_attempt(self, monkeypatch):
+    result, calls, state = self._run_restore(monkeypatch, verify_priority=1, drop_fails=1)
+    assert result is False
+    assert calls["rollback"] == 2  # 1차 실패 후 bounded 재시도
+    assert state["policy"] == os.SCHED_OTHER
+
+  def test_rollback_total_failure_returns_false_without_exception(self, monkeypatch):
+    # 커널이 롤백 syscall까지 거부: 예외 전파 없이 False, FIFO 잔류(파이썬에서 강제 불가).
+    # 이 상태에서도 update()는 plot을 잠그고 재활성화는 _demote 검증을 요구한다.
+    result, calls, state = self._run_restore(monkeypatch, verify_priority=1, drop_fails=2)
+    assert result is False
+    assert calls["rollback"] == 2  # 재시도 상한 준수 (폭주 없음)
+    assert state["policy"] == os.SCHED_FIFO  # 잔류를 숨기지 않고 그대로 노출
+
+
+class TestRestoreFailureLogging:
+  """update()의 복구 실패 로그가 실제 policy와 모순되지 않아야 한다."""
+
+  def _gate_with_log(self, monkeypatch, policy):
+    logs = {"error": [], "critical": [], "warning": []}
+    monkeypatch.setattr(cps, "cloudlog", types.SimpleNamespace(
+      error=logs["error"].append, critical=logs["critical"].append,
+      warning=logs["warning"].append, exception=lambda m: None))
+    g, _ = make_gate(restore_results=(False,))
+    g._current_policy = lambda: policy
+    g._mode_to_set = 1
+    g.update()
+    g._mode_to_set = 0
+    g.update()
+    return logs
+
+  def test_rolled_back_logs_staying_other(self, monkeypatch):
+    logs = self._gate_with_log(monkeypatch, os.SCHED_OTHER)
+    assert any("staying SCHED_OTHER" in m for m in logs["error"])
+    assert not logs["critical"]
+
+  def test_rollback_failed_logs_actual_policy(self, monkeypatch):
+    logs = self._gate_with_log(monkeypatch, os.SCHED_FIFO)
+    assert any("rollback FAILED" in m and f"policy={os.SCHED_FIFO}" in m for m in logs["critical"])
+    assert not any("staying SCHED_OTHER" in m for m in logs["error"])
