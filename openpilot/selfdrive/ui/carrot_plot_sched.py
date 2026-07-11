@@ -15,12 +15,13 @@ import sys
 import time
 
 from openpilot.common.params import Params
-from openpilot.common.realtime import Priority, config_realtime_process, drop_realtime
+from openpilot.common.realtime import Priority, drop_realtime
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.ui.carrot_params_watch import ParamsRefreshGate
 from openpilot.system.hardware import PC
 
 UI_CORE = 5
+PLOT_MODE_MIN, PLOT_MODE_MAX = 1, 8  # 공식 지원 plot 모드 범위
 
 
 class PlotSchedGate:
@@ -50,20 +51,56 @@ class PlotSchedGate:
 
   @staticmethod
   def _restore() -> bool:
+    """FIFO 53 + core5 복구. 어느 단계든 실패하면 SCHED_OTHER로 롤백해
+    '복구 실패 = 확실히 비RT 상태'를 보장한다 (부분 성공으로 FIFO만 남는 것 금지)."""
     if sys.platform != "linux" or PC:
       return True
     try:
-      # ui.py 초기 설정과 동일: FIFO 53 (above plannerd and radard) + core5
-      config_realtime_process(UI_CORE, Priority.CTRL_HIGH)
-      return os.sched_getscheduler(0) == os.SCHED_FIFO
+      # 아직 SCHED_OTHER인 상태에서 affinity 먼저 — FIFO 승격은 마지막 단계로 미뤄서
+      # affinity 실패가 'FIFO인데 False 반환' 같은 부분 성공을 만들지 못하게 한다
+      os.sched_setaffinity(0, {UI_CORE})
+      os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(Priority.CTRL_HIGH))
+      ok = (os.sched_getscheduler(0) == os.SCHED_FIFO
+            and os.sched_getparam(0).sched_priority == Priority.CTRL_HIGH
+            and os.sched_getaffinity(0) == {UI_CORE})
+      if not ok:
+        drop_realtime()
+      return ok
     except OSError:
+      try:
+        drop_realtime()  # 부분 성공했을 가능성까지 롤백
+      except OSError:
+        cloudlog.exception("PLOTSCHED: failed to roll back UI to SCHED_OTHER")
       return False
+
+  @staticmethod
+  def _current_policy() -> int:
+    if sys.platform != "linux":
+      return -1
+    try:
+      return os.sched_getscheduler(0)
+    except OSError:
+      return -1
+
+  def _read_mode(self) -> int:
+    """ShowPlotMode를 fail-closed로 읽는다. get_int()는 C++ std::stoi가 except+ 없이
+    선언되어 있어 손상된 값(비정수/overflow)이 UI 프로세스 종료로 전파될 수 있으므로
+    금지 — get()은 파이썬 변환 단계에서 ValueError를 잡아 default로 처리한다."""
+    try:
+      value = self._params.get("ShowPlotMode", return_default=True)
+    except Exception:
+      cloudlog.exception("PLOTSCHED: failed to read ShowPlotMode")
+      return 0
+    if type(value) is not int:  # bool은 int subclass이므로 정확한 int만 허용
+      return 0
+    # 범위 밖(음수/9+)은 0으로 정규화 — 1→-1 같은 전이에서도 FIFO 복구가 수행된다
+    return value if PLOT_MODE_MIN <= value <= PLOT_MODE_MAX else 0
 
   def update(self) -> int:
     """ui.py 렌더 루프에서 매 프레임 호출. 파라미터는 실제로 바뀐 경우에만 재읽기,
     스케줄러 syscall은 plot 활성/비활성 전이 시에만 1회 수행한다."""
     if self._refresh_gate.should_refresh(time.monotonic()):
-      self._raw_mode = self._params.get_int("ShowPlotMode") or 0
+      self._raw_mode = self._read_mode()
 
     mode = self._raw_mode
     if self._failed_mode is not None and mode != self._failed_mode:
@@ -82,8 +119,8 @@ class PlotSchedGate:
         cloudlog.warning("PLOTSCHED: DebugPlot inactive, UI restored to SCHED_FIFO 53")
       else:
         # 복구 실패는 안전 문제가 아니다(planner가 계속 UI를 선점 가능) — UI를 죽이지
-        # 않고 SCHED_OTHER로 유지. 다음 강등/복구 전이에서 자연히 재시도된다.
-        cloudlog.error("PLOTSCHED: UI RT restore FAILED, staying SCHED_OTHER")
+        # 않고 SCHED_OTHER로 유지(_restore가 롤백을 보장). 다음 전이에서 자연 재시도.
+        cloudlog.error(f"PLOTSCHED: UI RT restore FAILED (policy now {self._current_policy()}), staying SCHED_OTHER")
       self._demoted = False
 
     self._effective_mode = mode if (mode > 0 and self._demoted) else 0
