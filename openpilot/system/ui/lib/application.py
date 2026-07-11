@@ -307,6 +307,8 @@ class GuiApplication:
     self._record_t0 = 0.0
     self._record_every_n = 3
     self._record_frame_idx = 0
+    self._record_fail_count = 0   # 인코더 연속 실패 횟수 (정상 녹화 5초 유지 시 리셋)
+    self._record_fail_t = 0.0
 
   def _new_record_path(self) -> Path:
     self._record_dir.mkdir(parents=True, exist_ok=True)
@@ -315,6 +317,13 @@ class GuiApplication:
   
   def start_recording(self):
     if self._record_enabled:
+      return
+
+    # 연속 실패 시 재시도 폭주 차단: MainLayout이 캐시된 ScreenRecord=True로 매 프레임
+    # 재시작을 시도하므로, 짧은 간격 3연속 실패면 60초간 시작을 거부한다.
+    # is_recording()이 False로 유지되면 MainLayout이 ScreenRecord 파라미터를 꺼서
+    # 사용자에게도 실패가 드러난다.
+    if self._record_fail_count >= 3 and (time.monotonic() - self._record_fail_t) < 60.0:
       return
 
     self._ensure_render_texture_for_recording()
@@ -382,19 +391,27 @@ class GuiApplication:
         proc.kill()
       return
 
-    # ffmpeg 강등 검증 (fail-open 방지): chrt/taskset은 exec 체인에서 수 ms 내에 적용되므로
-    # 잠시 기다렸다가 실제 스케줄러/코어를 확인하고, RT나 core4/5가 남아 있으면 즉시 중단한다.
-    # 이 스레드는 이미 비RT라 sleep이 렌더 루프를 막지 않는다.
+    # ffmpeg 강등 검증 (fail-open 방지): chrt/taskset이 exec 체인에서 적용될 때까지
+    # 최대 1초간 재확인한다 — 시스템 부하가 높으면(60초 회전 직후 등) 100ms로는 부족해
+    # 위양성 실패가 났었음. 검증 전의 자식은 exec 체인 진행 중이라 CPU를 태우지 않으므로
+    # 기다려도 안전하고, 이 스레드는 이미 비RT라 sleep이 렌더 루프를 막지 않는다.
     if proc is not None and sys.platform == "linux":
-      time.sleep(0.1)
       try:
-        if proc.poll() is None:
-          demoted = (os.sched_getscheduler(proc.pid) == os.SCHED_OTHER
-                     and not (os.sched_getaffinity(proc.pid) & {4, 5}))
-          if not demoted:
-            print("[REC] ffmpeg demotion verification FAILED, killing encoder to protect driving processes")
+        policy, affinity = -1, set()
+        deadline = time.monotonic() + 1.0
+        while True:
+          if proc.poll() is not None:
+            return  # 죽은 인코더는 렌더 루프가 감지해 녹화를 멈춘다
+          policy = os.sched_getscheduler(proc.pid)
+          affinity = os.sched_getaffinity(proc.pid)
+          if policy == os.SCHED_OTHER and not (affinity & {4, 5}):
+            break
+          if time.monotonic() >= deadline:
+            print(f"[REC] ffmpeg demotion verification FAILED (policy={policy}, affinity={sorted(affinity)}), "
+                  "killing encoder to protect driving processes")
             proc.kill()
             return
+          time.sleep(0.05)
       except OSError as e:
         # 살아 있는 인코더를 검증할 수 없으면 안전하지 않은 것으로 간주하고 중단한다.
         # 이미 죽은 경우(ESRCH 등)는 렌더 루프가 감지해 녹화를 멈춘다.
@@ -431,6 +448,9 @@ class GuiApplication:
       "-c:v", "libx264",
       "-preset", preset,
       "-crf", str(record_quality),
+      # 입력이 ~6.7fps(20fps의 1/3)뿐이라 스레드 2개로 충분 — 무제한이면 x264가
+      # core0~3을 포화시켜 soundd 등 일반 프로세스가 밀린다 (녹화 중 lagging 관측)
+      "-threads", "2",
     ]
 
     if record_bitrate:
@@ -445,7 +465,8 @@ class GuiApplication:
     if sys.platform == "linux":
       # 자식 프로세스가 UI의 SCHED_FIFO 53/core5를 상속하지 않도록 검증된 런처로 강등해 실행.
       # preexec_fn은 멀티스레드 프로세스에서 fork 후 데드락 위험이 있어 쓰지 않는다.
-      ffmpeg_args = ["chrt", "--other", "0", "taskset", "--cpu-list", "0-3", *ffmpeg_args]
+      # nice 10: 인코딩은 최하 우선 — 같은 코어의 soundd 등 일반 프로세스에 양보
+      ffmpeg_args = ["chrt", "--other", "0", "taskset", "--cpu-list", "0-3", "nice", "-n", "10", *ffmpeg_args]
 
     try:
       self._ffmpeg_proc = subprocess.Popen(ffmpeg_args, stdin=subprocess.PIPE)
@@ -966,11 +987,17 @@ class GuiApplication:
             if self._ffmpeg_proc is None or self._ffmpeg_proc.poll() is not None:
               # 인코더 사망(강등 검증 실패로 kill된 경우 포함) — 실제로는 기록되지
               # 않는데 녹화 중인 것처럼 보이지 않도록 즉시 녹화를 멈춘다
-              print("[REC] encoder not running, stopping recording")
+              self._record_fail_count += 1
+              self._record_fail_t = time.monotonic()
+              giving_up = " (repeated failures, giving up)" if self._record_fail_count >= 3 else ""
+              print(f"[REC] encoder not running, stopping recording{giving_up}")
               self.stop_recording()
             elif (time.monotonic() - self._record_t0) >= self._record_max_sec:
               self.stop_recording()
               self.start_recording()
+            elif self._record_fail_count and (time.monotonic() - self._record_t0) > 5.0:
+              # 5초 이상 정상 녹화 = 직전 실패는 일시적이었던 것 — 카운터 리셋
+              self._record_fail_count = 0
 
         self._monitor_fps()
         self._frame += 1
