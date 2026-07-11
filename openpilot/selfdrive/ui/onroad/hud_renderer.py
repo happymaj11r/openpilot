@@ -4,6 +4,7 @@ import pyray as rl
 from dataclasses import dataclass
 from openpilot.common.constants import CV
 from openpilot.selfdrive.ui.carrot_params_watch import ParamsRefreshGate
+from openpilot.selfdrive.ui.carrot_plot_sched import plot_sched_gate
 from openpilot.selfdrive.ui.onroad.exp_button import ExpButton
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.system.ui.lib.application import gui_app, FontWeight
@@ -1201,8 +1202,6 @@ class PlotRenderer:
     self._plot_height = 300.0
     self._plot_dx = 2.0
     self._show_plot_mode_prev = -1
-    self._plot_mode_cached = 0
-    self._plot_params_gate = ParamsRefreshGate()
 
   def _clear(self):
     self._plot_size = 0
@@ -1389,10 +1388,8 @@ class PlotRenderer:
       )
 
   def draw(self, rect: rl.Rectangle, font) -> None:
-    # ShowPlotMode는 설정이 실제로 바뀐 경우에만 다시 읽는다
-    if self._plot_params_gate.should_refresh(time.monotonic()):
-      self._plot_mode_cached = ui_state.params.get_int('ShowPlotMode')
-    show_plot_mode = self._plot_mode_cached
+    # 스케줄러 강등이 검증된 경우에만 0이 아닌 값 (fail-closed, route 416)
+    show_plot_mode = plot_sched_gate.effective_mode
     if show_plot_mode == 0:
       return
     try:

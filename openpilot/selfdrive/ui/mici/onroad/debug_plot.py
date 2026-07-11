@@ -4,13 +4,20 @@ from typing import List, Tuple
 
 import pyray as rl
 
-from openpilot.common.params import Params
+from openpilot.common.swaglog import cloudlog
 from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.lib.application import gui_app, FontWeight
+from openpilot.selfdrive.ui.carrot_plot_sched import plot_sched_gate
 from openpilot.selfdrive.ui.ui_state import ui_state
 
 
 PLOT_MAX = 300
+
+# batch line API 가용성은 로드 시 1회만 판정 — draw_spline_linear는 두께 있는
+# 폴리라인을 한 번에 그린다 (driver_state.py에서 사용 중인 검증된 바인딩)
+_HAS_SPLINE = hasattr(rl, "draw_spline_linear")
+_HAS_LINE_STRIP = hasattr(rl, "draw_line_strip")
+_batch_warned = False
 
 
 def _safe_get(obj, path: str, default=0.0):
@@ -66,9 +73,13 @@ class DebugPlot(Widget):
     super().__init__()
     self.set_rect(rl.Rectangle(0, 0, gui_app.width, gui_app.height))
 
-    self.params = Params()
-
     self._font_display: rl.Font = gui_app.font(FontWeight.DISPLAY)
+
+    # batch 드로잉용 재사용 버퍼 (프레임마다 할당하지 않는다)
+    self._pts = [rl.Vector2(0, 0) for _ in range(PLOT_MAX)]
+    self._xs = [0.0] * PLOT_MAX
+    self._xs_key: tuple[float, float] | None = None
+    self._title_cached = "no data"
 
     # plot state
     self.plot_size = 0
@@ -226,29 +237,64 @@ class DebugPlot(Widget):
     idx = (self.plot_index - k_back) % PLOT_MAX
     return self.plot_queue[series_idx][idx]
 
+  def _update_x_cache(self):
+    key = (self.plot_x, self.plot_dx)
+    if key != self._xs_key:
+      xs = self._xs
+      for i in range(PLOT_MAX):
+        xs[i] = self.plot_x + i * self.plot_dx
+      self._xs_key = key
+
   def _draw_series(self, rect: rl.Rectangle, series_idx: int, color: rl.Color, stroke: int = 3):
-    if self.plot_size < 2:
+    n = self.plot_size
+    if n < 2:
       return
 
     pr = self.plot_max - self.plot_min
     ratio = self.plot_height if pr < 1e-6 else (self.plot_height / pr)
 
-    prev_x = None
-    prev_y = None
+    # oldest -> newest 순서로 포인트 버퍼를 채운다 (ring buffer 순서 보존)
+    q = self.plot_queue[series_idx]
+    pts = self._pts
+    xs = self._xs
+    base = self.plot_y + self.plot_height
+    mn = self.plot_min
+    idx0 = (self.plot_index - (n - 1)) % PLOT_MAX
+    for i in range(n):
+      p = pts[i]
+      p.x = xs[i]
+      p.y = base - (q[(idx0 + i) % PLOT_MAX] - mn) * ratio
 
-    for i in range(self.plot_size):
-      k_back = (self.plot_size - 1) - i  # oldest -> newest
-      val = self._get_series_value(series_idx, k_back)
-      x = self.plot_x + i * self.plot_dx
-      y = self.plot_y + self.plot_height - (val - self.plot_min) * ratio
+    prev_x = pts[n - 1].x
+    prev_y = pts[n - 1].y
 
-      if prev_x is not None:
+    # 시리즈당 draw 콜을 1~stroke회로 제한 — 기존 per-segment 방식은 프레임당
+    # 약 2,691회의 Python->raylib 콜로 UI를 상시 실행 상태로 만들었다 (route 416)
+    global _batch_warned
+    if _HAS_SPLINE:
+      rl.draw_spline_linear(pts, n, float(max(1, stroke)), color)
+    elif _HAS_LINE_STRIP:
+      offsets = range(-(stroke // 2), stroke // 2 + 1) if stroke > 1 else range(1)
+      applied = 0
+      for o in offsets:
+        d = o - applied
+        if d:
+          for i in range(n):
+            pts[i].y += d
+          applied = o
+        rl.draw_line_strip(pts, n, color)
+    else:
+      if not _batch_warned:
+        _batch_warned = True
+        cloudlog.warning("PLOTDRAW: no batch line API in pyray, falling back to per-segment draw_line")
+      for i in range(1, n):
+        x0, y0 = pts[i - 1].x, pts[i - 1].y
+        x1, y1 = pts[i].x, pts[i].y
         if stroke <= 1:
-          rl.draw_line(int(prev_x), int(prev_y), int(x), int(y), color)
+          rl.draw_line(int(x0), int(y0), int(x1), int(y1), color)
         else:
           for o in range(-(stroke // 2), stroke // 2 + 1):
-            rl.draw_line(int(prev_x), int(prev_y) + o, int(x), int(y) + o, color)
-      prev_x, prev_y = x, y
+            rl.draw_line(int(x0), int(y0) + o, int(x1), int(y1) + o, color)
 
     last_val = self._get_series_value(series_idx, 0)
     label = f"{last_val:.2f}"
@@ -281,7 +327,9 @@ class DebugPlot(Widget):
     rl.draw_text(label, x, y, font_size, color)
 
   def _render(self, rect: rl.Rectangle):
-    show_plot_mode = int(self.params.get_int("ShowPlotMode"))
+    # 스케줄러 강등이 검증된 경우에만 0이 아닌 값 (fail-closed, route 416) —
+    # 파라미터 직접 읽기 금지, 게이트가 변경 감지로 갱신한다
+    show_plot_mode = plot_sched_gate.effective_mode
     if show_plot_mode == 0:
       return
 
@@ -308,6 +356,7 @@ class DebugPlot(Widget):
     self.plot_height = float(max(60, H - title_h))  
 
     self.plot_dx = float(max(1.0, plot_w / max(1, (PLOT_MAX - 1))))
+    self._update_x_cache()
 
     # background (transparent)
     rl.draw_rectangle_rec(rect, rl.Color(0, 0, 0, 0))
@@ -329,8 +378,10 @@ class DebugPlot(Widget):
 
       plot_data, title = self._make_plot_data(sm, show_plot_mode)
       self._update_plot_queue(plot_data)
+      self._title_cached = title
     else:
-      plot_data, title = self._make_plot_data(sm, show_plot_mode)
+      # 샘플링하지 않는 프레임에는 메시지 재조회 없이 캐시된 title만 사용
+      title = self._title_cached
 
     # draw grid (only within rect)
     grid_color = rl.Color(60, 60, 60, 120)

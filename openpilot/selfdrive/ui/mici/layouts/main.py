@@ -10,6 +10,7 @@ from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.widgets.scroller import Scroller
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.selfdrive.ui.mici.onroad.debug_plot import DebugPlot
+from openpilot.selfdrive.ui.carrot_plot_sched import plot_sched_gate
 
 ONROAD_DELAY = 2.5  # seconds
 
@@ -159,7 +160,8 @@ class MiciMainLayout(Scroller):
       self._onroad_time_delay = None
       
     if ui_state.started:
-      show_plot_mode = ui_state.params.get_int("ShowPlotMode")
+      # 스케줄러 강등이 검증된 경우에만 0이 아닌 값 (fail-closed, route 416)
+      show_plot_mode = plot_sched_gate.effective_mode
       cluster_hud_connected = ui_state.params.get_bool("ClusterHudConnected")
       effective_plot_mode = 0 if cluster_hud_connected else show_plot_mode
       if effective_plot_mode != self._show_plot_mode:
