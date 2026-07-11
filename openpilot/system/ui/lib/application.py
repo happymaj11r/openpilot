@@ -1022,9 +1022,11 @@ class GuiApplication:
               self.stop_recording()
               self.start_recording()
             elif (self._record_fail_count and (time.monotonic() - self._record_t0) > 5.0
-                  and self._ffmpeg_thread is not None and self._ffmpeg_thread.is_alive()):
+                  and self._ffmpeg_thread is not None and self._ffmpeg_thread.is_alive()
+                  and not self._record_failure_event.is_set()):
               # 5초 이상 정상 녹화(인코더 프로세스·라이터 스레드 모두 생존) = 직전 실패는
-              # 일시적이었던 것 — 카운터 리셋
+              # 일시적이었던 것 — 카운터 리셋. 마지막 Event 재확인은 is_alive() 평가 중
+              # 라이터가 finally에서 실패를 알리는 race에서 카운터가 리셋되는 것을 막는다
               self._record_fail_count = 0
 
         self._monitor_fps()
