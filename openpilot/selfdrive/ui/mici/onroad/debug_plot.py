@@ -82,8 +82,9 @@ class DebugPlot(Widget):
     self._xs = [0.0] * PLOT_MAX
     self._xs_key: tuple[float, float] | None = None
     self._title_cached = "no data"
-    # wall/cpu 분리 계측 — SCHED_OTHER 강등 후 선점 대기와 실제 렌더 비용 구분용
-    self._plot_metrics = SectionMetrics("debugPlot")
+    # wall/cpu 분리 계측 — SCHED_OTHER 강등 후 선점 대기와 실제 렌더 비용 구분용.
+    # window 100 ≈ 13fps 기준 7.7초 — 짧은 진단 단계(20~30초)에서도 clean 윈도 확보
+    self._plot_metrics = SectionMetrics("debugPlot", window=100)
 
     # plot state
     self.plot_size = 0
@@ -250,13 +251,17 @@ class DebugPlot(Widget):
       self._xs_key = key
 
   def _draw_series(self, rect: rl.Rectangle, series_idx: int, color: rl.Color, stroke: int = 3):
-    # 실제 선택된 backend를 프로세스 수명당 1회만 기록 (성능 분석용, 매 프레임 금지)
+    # 실제 선택된 backend를 프로세스 수명당 1회만 기록 (성능 분석용, 매 프레임 금지).
+    # 진단 로그가 첫 plot 프레임을 죽이면 안 되므로 no-throw
     global _backend_logged
     if not _backend_logged:
       _backend_logged = True
-      backend = "spline" if _HAS_SPLINE else ("line_strip" if _HAS_LINE_STRIP else "legacy")
-      ver = getattr(rl, "RAYLIB_VERSION", "?")
-      cloudlog.warning(f"PLOTDRAW: backend={backend} points={PLOT_MAX} series=3 stroke={stroke} raylib={ver}")
+      try:
+        backend = "spline" if _HAS_SPLINE else ("line_strip" if _HAS_LINE_STRIP else "legacy")
+        ver = getattr(rl, "RAYLIB_VERSION", "?")
+        cloudlog.warning(f"PLOTDRAW: backend={backend} points={PLOT_MAX} series=3 stroke={stroke} raylib={ver}")
+      except Exception:
+        pass
 
     n = self.plot_size
     if n < 2:
@@ -298,7 +303,10 @@ class DebugPlot(Widget):
     else:
       if not _batch_warned:
         _batch_warned = True
-        cloudlog.warning("PLOTDRAW: no batch line API in pyray, falling back to per-segment draw_line")
+        try:
+          cloudlog.warning("PLOTDRAW: no batch line API in pyray, falling back to per-segment draw_line")
+        except Exception:
+          pass
       for i in range(1, n):
         x0, y0 = pts[i - 1].x, pts[i - 1].y
         x1, y1 = pts[i].x, pts[i].y
@@ -354,6 +362,8 @@ class DebugPlot(Widget):
       self._reset_plot()
       self.show_plot_mode_prev = show_plot_mode
 
+    # 단계(모드/녹화) 경계가 한 집계 윈도에 섞이지 않게 phase 키로 분리
+    self._plot_metrics.set_phase((show_plot_mode, gui_app.is_recording()))
     _tok = self._plot_metrics.begin()
 
     # === full-area layout (use entire rect) ===

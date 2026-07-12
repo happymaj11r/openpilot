@@ -1,7 +1,7 @@
 """carrot 전용: SectionMetrics(wall/cpu 분리 계측) 회귀 테스트.
 
-계측은 진단 도구일 뿐이므로 어떤 실패도 UI 렌더 루프로 전파되면 안 되고,
-매 프레임 로그 없이 윈도 집계 한 줄만 남겨야 한다.
+계측은 진단 도구일 뿐이므로 어떤 실패도 UI 렌더 루프로 전파되면 안 되고(no-throw),
+매 프레임 로그 없이 윈도 집계 한 줄만 남기며, phase 경계가 한 줄에 섞이면 안 된다.
 """
 import types
 
@@ -15,7 +15,7 @@ def _capture_logs(monkeypatch):
   return logs
 
 
-class TestSectionMetrics:
+class TestAggregation:
   def test_no_log_until_window_full(self, monkeypatch):
     logs = _capture_logs(monkeypatch)
     m = SectionMetrics("test", window=10)
@@ -31,6 +31,13 @@ class TestSectionMetrics:
     assert len(logs) == 2  # 10개마다 1줄, 나머지 5개는 대기
     assert all("PLOTPERF test:" in line and "n=10" in line for line in logs)
 
+  def test_window_timestamps_present(self, monkeypatch):
+    logs = _capture_logs(monkeypatch)
+    m = SectionMetrics("test", window=2)
+    m.add(1.0, 1.0)
+    m.add(1.0, 1.0)
+    assert "t0=" in logs[0] and "t1=" in logs[0]  # 윈도 시작/종료 시각으로 단계 매핑
+
   def test_negative_samples_clamped(self, monkeypatch):
     logs = _capture_logs(monkeypatch)
     m = SectionMetrics("test", window=2)
@@ -38,6 +45,48 @@ class TestSectionMetrics:
     m.add(3.0, 2.0)
     assert "max=3.00" in logs[0]
     assert "mean=1.50" in logs[0]  # (0+3)/2 — 음수가 통계를 왜곡하지 않는다
+
+  def test_begin_end_produces_nonnegative_sample(self, monkeypatch):
+    logs = _capture_logs(monkeypatch)
+    m = SectionMetrics("test", window=1)
+    tok = m.begin()
+    m.end(tok)
+    assert len(logs) == 1
+    assert "wall mean=" in logs[0] and "cpu mean=" in logs[0]
+
+
+class TestNoThrow:
+  """계측의 어떤 실패도 호출자(렌더 루프)로 전파되면 안 된다."""
+
+  def test_begin_clock_failure_returns_none(self, monkeypatch):
+    def boom():
+      raise OSError("clock down")
+    monkeypatch.setattr(crm, "time", types.SimpleNamespace(
+      perf_counter_ns=boom, thread_time_ns=boom, monotonic=lambda: 0.0))
+    assert SectionMetrics.begin() is None
+
+  def test_end_none_token_is_noop(self, monkeypatch):
+    logs = _capture_logs(monkeypatch)
+    m = SectionMetrics("test", window=1)
+    m.end(None)  # begin 실패 시 토큰 — no-op이어야 한다
+    assert logs == [] and len(m._wall) == 0
+
+  def test_end_malformed_token_swallowed(self, monkeypatch):
+    _capture_logs(monkeypatch)
+    m = SectionMetrics("test", window=10)
+    m.end("garbage")
+    m.end((1,))  # index 부족
+    m.end((None, None))  # 연산 불가
+    assert len(m._wall) == 0 == len(m._cpu)
+
+  def test_add_conversion_failure_keeps_buffers_paired(self, monkeypatch):
+    _capture_logs(monkeypatch)
+    m = SectionMetrics("test", window=10)
+    m.add("abc", 1.0)      # wall 변환 실패
+    m.add(1.0, object())   # cpu 변환 실패 — wall만 append되면 안 된다
+    assert len(m._wall) == 0 == len(m._cpu)
+    m.add(1.0, 1.0)
+    assert len(m._wall) == 1 == len(m._cpu)
 
   def test_emit_failure_does_not_propagate(self, monkeypatch):
     def boom(_):
@@ -58,10 +107,55 @@ class TestSectionMetrics:
       m.add(1.0, 1.0)
     assert calls["n"] == 3  # 실패해도 버퍼는 리셋되어 무한 누적되지 않는다
 
-  def test_begin_end_produces_nonnegative_sample(self, monkeypatch):
+
+class TestPhaseAndFlush:
+  def test_phase_change_flushes_partial_window(self, monkeypatch):
     logs = _capture_logs(monkeypatch)
-    m = SectionMetrics("test", window=1)
-    tok = m.begin()
-    m.end(tok)
+    m = SectionMetrics("test", window=100)
+    m.set_phase((1, False))
+    for _ in range(7):
+      m.add(1.0, 1.0)
+    m.set_phase((1, True))  # 녹화 시작 — 이전 단계 7개가 섞이면 안 된다
     assert len(logs) == 1
-    assert "wall mean=" in logs[0] and "cpu mean=" in logs[0]
+    assert "phase=1/False" in logs[0] and "n=7" in logs[0]
+    m.add(2.0, 2.0)
+    assert len(m._wall) == 1  # 새 단계는 빈 버퍼에서 시작
+
+  def test_same_phase_does_not_flush(self, monkeypatch):
+    logs = _capture_logs(monkeypatch)
+    m = SectionMetrics("test", window=100)
+    m.set_phase((1, False))
+    m.add(1.0, 1.0)
+    m.set_phase((1, False))  # 동일 키 — flush 없음
+    assert logs == [] and len(m._wall) == 1
+
+  def test_phase_label_in_full_window_emit(self, monkeypatch):
+    logs = _capture_logs(monkeypatch)
+    m = SectionMetrics("test", window=2)
+    m.set_phase((3, True))
+    m.add(1.0, 1.0)
+    m.add(1.0, 1.0)
+    assert "phase=3/True" in logs[0]
+
+  def test_flush_empty_is_noop(self, monkeypatch):
+    logs = _capture_logs(monkeypatch)
+    m = SectionMetrics("test", window=10)
+    m.flush()
+    assert logs == []
+
+  def test_flush_partial_emits_and_resets(self, monkeypatch):
+    logs = _capture_logs(monkeypatch)
+    m = SectionMetrics("test", window=100)
+    for _ in range(3):
+      m.add(1.0, 1.0)
+    m.flush()  # 녹화 stop 등 세션 경계
+    assert len(logs) == 1 and "n=3" in logs[0]
+    assert len(m._wall) == 0
+
+  def test_set_phase_exception_swallowed(self, monkeypatch):
+    _capture_logs(monkeypatch)
+    m = SectionMetrics("test", window=10)
+    class Weird:
+      def __eq__(self, other):
+        raise RuntimeError("cmp fail")
+    m.set_phase(Weird())  # 비교 실패도 전파 금지

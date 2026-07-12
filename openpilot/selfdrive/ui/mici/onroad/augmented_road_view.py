@@ -13,6 +13,7 @@ from openpilot.selfdrive.ui.mici.onroad.confidence_ball import ConfidenceBall
 from openpilot.selfdrive.ui.mici.onroad.cameraview import CameraView
 from openpilot.system.ui.lib.application import FontWeight, gui_app, MousePos, MouseEvent
 from openpilot.system.ui.lib.carrot_render_metrics import SectionMetrics
+from openpilot.selfdrive.ui.carrot_plot_sched import plot_sched_gate
 from openpilot.system.ui.widgets.label import UnifiedLabel
 from openpilot.system.ui.widgets import Widget
 from openpilot.common.filter_simple import BounceFilter, FirstOrderFilter
@@ -177,8 +178,9 @@ class AugmentedRoadView(CameraView):
     # debug
     self._pm = messaging.PubMaster(['uiDebug'])
     # wall/cpu 분리 계측 — drawTimeMillis(wall)만으로는 SCHED_OTHER 선점 대기와
-    # 실제 렌더 비용을 구분할 수 없다 (route 418 진단)
-    self._render_metrics = SectionMetrics("uiRender")
+    # 실제 렌더 비용을 구분할 수 없다 (route 418 진단). window 100 ≈ 저FPS에서도
+    # 짧은 진단 단계(20~30초) 안에 clean 윈도가 나온다
+    self._render_metrics = SectionMetrics("uiRender", window=100)
 
   def is_swiping_left(self) -> bool:
     """Check if currently swiping left (for scroller to disable)."""
@@ -202,6 +204,8 @@ class AugmentedRoadView(CameraView):
 
   def _render(self, _):
     start_draw = time.monotonic()
+    # 단계(plot 모드/녹화) 경계가 한 집계 윈도에 섞이지 않게 phase 키로 분리
+    self._render_metrics.set_phase((plot_sched_gate.effective_mode, gui_app.is_recording()))
     _tok = self._render_metrics.begin()
     self._switch_stream_if_needed(ui_state.sm)
 
@@ -280,10 +284,11 @@ class AugmentedRoadView(CameraView):
       y = int(self._content_rect.y + self._content_rect.height - 16)
       rl.draw_circle(x, y, 6, rl.Color(255, 0, 0, 220))
 
-    # publish uiDebug
-    self._render_metrics.end(_tok)
+    # publish uiDebug — 기존 drawTimeMillis 값을 먼저 확정한 뒤 계측을 기록해서
+    # PLOTPERF emit(sort/문자열/cloudlog) 비용이 기존 지표의 spike로 오염되지 않게 한다
     msg = messaging.new_message('uiDebug')
     msg.uiDebug.drawTimeMillis = (time.monotonic() - start_draw) * 1000
+    self._render_metrics.end(_tok)
     self._pm.send('uiDebug', msg)
 
   def _road_view_mode(self):

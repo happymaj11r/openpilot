@@ -313,8 +313,10 @@ class GuiApplication:
     # 라이터 스레드의 비정상 종료 신호 — 인코더 프로세스가 살아 있어도(예: kill 실패,
     # stdin write 예외) 렌더 루프가 실패를 감지할 수 있게 한다. 세션마다 새 객체로 교체.
     self._record_failure_event = threading.Event()
-    # 캡처(동기 GPU readback) 구간의 wall/cpu 분리 계측 (route 418 진단)
-    self._capture_metrics = SectionMetrics("screenCapture")
+    # 캡처(동기 GPU readback) 구간의 wall/cpu 분리 계측 (route 418 진단).
+    # 캡처는 3프레임당 1회뿐이라 window 50 ≈ 13fps 기준 11.6초 — 30초 진단
+    # 구간에서도 집계가 나온다 (200이면 46초가 필요해 로그 0줄 가능)
+    self._capture_metrics = SectionMetrics("screenCapture", window=50)
 
   def _new_record_path(self) -> Path:
     self._record_dir.mkdir(parents=True, exist_ok=True)
@@ -352,6 +354,8 @@ class GuiApplication:
       return
     self._record_enabled = False
     self.close_ffmpeg()  # application.py에 이미 있는 close_ffmpeg 그대로 사용
+    # 세션 경계에서 부분 윈도 배출 — 다음 녹화(60초 회전 포함)와 집계가 섞이지 않게
+    self._capture_metrics.flush()
     print("[REC] stop")
 
   def toggle_recording(self):
@@ -1007,13 +1011,14 @@ class GuiApplication:
             image = rl.load_image_from_texture(self._render_texture.texture)
             data_size = image.width * image.height * 4
             data = bytes(rl.ffi.buffer(image.data, data_size))
+            rl.unload_image(image)
+            if cap_tok is not None:
+              # readback+복사+해제까지만 계측 — 큐 비용은 캡처 비용이 아니므로 제외
+              self._capture_metrics.end(cap_tok)
             try:
               self._ffmpeg_queue.put_nowait(data)  # Async write via background thread
             except queue.Full:
               pass
-            rl.unload_image(image)
-            if cap_tok is not None:
-              self._capture_metrics.end(cap_tok)
             
           if self._record_enabled:
             if (self._record_failure_event.is_set()

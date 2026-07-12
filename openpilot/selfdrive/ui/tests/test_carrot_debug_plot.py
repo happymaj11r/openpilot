@@ -156,6 +156,7 @@ class TestBackendLog:
     assert len(logs) == 1
     assert "backend=spline" in logs[0]
     assert "points=300" in logs[0] and "series=3" in logs[0] and "stroke=3" in logs[0]
+    assert "raylib=?" in logs[0]  # RAYLIB_VERSION 부재 시 getattr 폴백
 
   def test_line_strip_logged_once(self, monkeypatch):
     logs = self._run(monkeypatch, False, True)
@@ -164,3 +165,33 @@ class TestBackendLog:
   def test_legacy_logged_once(self, monkeypatch):
     logs = self._run(monkeypatch, False, False)
     assert len(logs) == 1 and "backend=legacy" in logs[0]
+
+  def test_legacy_backend_and_fallback_warning_each_once(self, monkeypatch):
+    # legacy에서는 backend 로그와 per-segment 폴백 경고가 각각 정확히 1회
+    p, _ = make_plot(monkeypatch, has_spline=False, has_strip=False)
+    warnings = []
+    monkeypatch.setattr(dp, "cloudlog", types.SimpleNamespace(warning=warnings.append))
+    monkeypatch.setattr(dp, "_backend_logged", False)
+    p._draw_series(RECT, 0, COLOR, stroke=3)
+    p._draw_series(RECT, 1, COLOR, stroke=3)
+    assert len([w for w in warnings if "backend=legacy" in w]) == 1
+    assert len([w for w in warnings if "no batch line API" in w]) == 1
+
+  def test_backend_log_failure_swallowed_and_not_retried(self, monkeypatch):
+    # 진단 로그 장애가 첫 plot 프레임을 죽이면 안 되고, 다음 프레임 재시도도 없어야 한다
+    p, fake = make_plot(monkeypatch, has_spline=True, has_strip=True)
+    def boom(_):
+      raise RuntimeError("log backend down")
+    monkeypatch.setattr(dp, "cloudlog", types.SimpleNamespace(warning=boom))
+    monkeypatch.setattr(dp, "_backend_logged", False)
+    p._draw_series(RECT, 0, COLOR, stroke=3)  # 예외가 전파되면 테스트 실패
+    assert dp._backend_logged is True
+    assert len(fake.spline_calls) == 1  # 로그 실패와 무관하게 그리기는 수행
+
+  def test_fallback_warning_failure_swallowed(self, monkeypatch):
+    p, fake = make_plot(monkeypatch, has_spline=False, has_strip=False)
+    def boom(_):
+      raise RuntimeError("log backend down")
+    monkeypatch.setattr(dp, "cloudlog", types.SimpleNamespace(warning=boom))
+    p._draw_series(RECT, 0, COLOR, stroke=3)  # _batch_warned 경고 실패도 무전파
+    assert len(fake.line_calls) == (PLOT_MAX - 1) * 3
