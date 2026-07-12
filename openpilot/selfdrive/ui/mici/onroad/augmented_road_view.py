@@ -203,9 +203,10 @@ class AugmentedRoadView(CameraView):
       super()._handle_mouse_release(mouse_pos)
 
   def _render(self, _):
+    # phase 전환(과 그때의 부분 윈도 emit 비용)은 drawTimeMillis 측정 밖에서 처리 —
+    # 단계 전환 프레임에 인위적 spike가 기록되지 않는다. 세션 ID로 60초 회전도 분리
+    self._render_metrics.set_phase((plot_sched_gate.effective_mode, *gui_app.recording_phase()))
     start_draw = time.monotonic()
-    # 단계(plot 모드/녹화) 경계가 한 집계 윈도에 섞이지 않게 phase 키로 분리
-    self._render_metrics.set_phase((plot_sched_gate.effective_mode, gui_app.is_recording()))
     _tok = self._render_metrics.begin()
     self._switch_stream_if_needed(ui_state.sm)
 

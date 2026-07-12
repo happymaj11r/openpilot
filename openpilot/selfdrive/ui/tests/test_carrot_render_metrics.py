@@ -38,6 +38,35 @@ class TestAggregation:
     m.add(1.0, 1.0)
     assert "t0=" in logs[0] and "t1=" in logs[0]  # 윈도 시작/종료 시각으로 단계 매핑
 
+  def test_t0_t1_are_sample_boundaries_not_emit_time(self, monkeypatch):
+    # 늦은 flush(예: 인코더 close 후 수십 초)가 t1을 오염시키면 단계 매핑이 불가능해진다
+    logs = _capture_logs(monkeypatch)
+    clock = {"mono": 10.0}
+    monkeypatch.setattr(crm, "time", types.SimpleNamespace(
+      perf_counter_ns=lambda: 0, thread_time_ns=lambda: 0,
+      monotonic=lambda: clock["mono"]))
+    m = SectionMetrics("test", window=100)
+    m.add(1.0, 1.0)        # 첫 샘플: t0=10.0
+    clock["mono"] = 12.5
+    m.add(1.0, 1.0)        # 마지막 샘플: t1=12.5
+    clock["mono"] = 70.0   # flush가 한참 뒤에 불림
+    m.flush()
+    assert "t0=10.0" in logs[0] and "t1=12.5" in logs[0]
+
+  def test_end_uses_token_start_time(self, monkeypatch):
+    logs = _capture_logs(monkeypatch)
+    clock = {"mono": 5.0}
+    monkeypatch.setattr(crm, "time", types.SimpleNamespace(
+      perf_counter_ns=lambda: 0, thread_time_ns=lambda: 0,
+      monotonic=lambda: clock["mono"]))
+    m = SectionMetrics("test", window=100)
+    tok = m.begin()        # 샘플 시작 5.0
+    clock["mono"] = 6.0
+    m.end(tok)             # 샘플 종료 6.0
+    clock["mono"] = 99.0
+    m.flush()
+    assert "t0=5.0" in logs[0] and "t1=6.0" in logs[0]
+
   def test_negative_samples_clamped(self, monkeypatch):
     logs = _capture_logs(monkeypatch)
     m = SectionMetrics("test", window=2)
@@ -136,6 +165,18 @@ class TestPhaseAndFlush:
     m.add(1.0, 1.0)
     m.add(1.0, 1.0)
     assert "phase=3/True" in logs[0]
+
+  def test_recording_session_id_separates_rotation(self, monkeypatch):
+    # 60초 회전: 같은 프레임에 stop→start라 recording bool은 True→True로 동일 —
+    # 세션 ID가 증가해야 회전 전후 부분 윈도가 분리된다
+    logs = _capture_logs(monkeypatch)
+    m = SectionMetrics("test", window=100)
+    m.set_phase((1, True, 1))
+    for _ in range(4):
+      m.add(1.0, 1.0)
+    m.set_phase((1, True, 2))  # 회전 후 새 세션
+    assert len(logs) == 1
+    assert "phase=1/True/1" in logs[0] and "n=4" in logs[0]
 
   def test_flush_empty_is_noop(self, monkeypatch):
     logs = _capture_logs(monkeypatch)

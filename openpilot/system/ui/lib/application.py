@@ -317,6 +317,9 @@ class GuiApplication:
     # 캡처는 3프레임당 1회뿐이라 window 50 ≈ 13fps 기준 11.6초 — 30초 진단
     # 구간에서도 집계가 나온다 (200이면 46초가 필요해 로그 0줄 가능)
     self._capture_metrics = SectionMetrics("screenCapture", window=50)
+    # 녹화 세션 카운터 — 60초 회전은 같은 프레임에 stop→start라 recording bool만으로는
+    # 계측 phase가 구분되지 않는다. 시작 성공마다 증가시켜 회전 전후를 분리한다
+    self._record_session_id = 0
 
   def _new_record_path(self) -> Path:
     self._record_dir.mkdir(parents=True, exist_ok=True)
@@ -346,6 +349,7 @@ class GuiApplication:
       return
 
     self._record_enabled = True
+    self._record_session_id += 1
     self._record_t0 = time.monotonic()
     print(f"[REC] start -> {out_path}")
 
@@ -353,9 +357,10 @@ class GuiApplication:
     if not self._record_enabled:
       return
     self._record_enabled = False
-    self.close_ffmpeg()  # application.py에 이미 있는 close_ffmpeg 그대로 사용
-    # 세션 경계에서 부분 윈도 배출 — 다음 녹화(60초 회전 포함)와 집계가 섞이지 않게
+    # 부분 윈도 배출은 blocking인 close_ffmpeg(최대 수십 초)보다 먼저 — 로그가
+    # 단계 경계 시점에 즉시 남고, 다음 녹화(60초 회전 포함)와 집계가 섞이지 않는다
     self._capture_metrics.flush()
+    self.close_ffmpeg()  # application.py에 이미 있는 close_ffmpeg 그대로 사용
     print("[REC] stop")
 
   def toggle_recording(self):
@@ -366,6 +371,11 @@ class GuiApplication:
 
   def is_recording(self) -> bool:
     return self._record_enabled
+
+  def recording_phase(self) -> tuple[bool, int]:
+    """계측 phase용 (녹화 중 여부, 세션 ID) — 60초 회전처럼 같은 프레임에
+    stop→start가 일어나도 세션 ID가 증가해 회전 전후 집계가 분리된다."""
+    return self._record_enabled, self._record_session_id
 
   def _ensure_render_texture_for_recording(self):
     if self._render_texture is None:

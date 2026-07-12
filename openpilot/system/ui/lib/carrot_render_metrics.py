@@ -25,12 +25,15 @@ class SectionMetrics:
     self._wall: list[float] = []
     self._cpu: list[float] = []
     self._phase = None
-    self._t0: float | None = None  # 현재 윈도 첫 샘플의 monotonic (로그의 t0)
+    # 윈도 경계 시각: t0=첫 샘플 시작, t1=마지막 샘플 종료 (emit 시각이 아님 —
+    # flush가 늦게 불려도(예: 인코더 close 후) 로그의 시간 경계는 정확해야 한다)
+    self._t0: float | None = None
+    self._t1: float | None = None
 
   @staticmethod
   def begin():
     try:
-      return time.perf_counter_ns(), time.thread_time_ns()
+      return time.perf_counter_ns(), time.thread_time_ns(), time.monotonic()
     except Exception:
       return None  # end(None)은 no-op — 계측 실패가 렌더 루프를 못 죽인다
 
@@ -40,18 +43,20 @@ class SectionMetrics:
     try:
       wall_ms = (time.perf_counter_ns() - token[0]) / 1e6
       cpu_ms = (time.thread_time_ns() - token[1]) / 1e6
-      self.add(wall_ms, cpu_ms)
+      self.add(wall_ms, cpu_ms, t_start=token[2], t_end=time.monotonic())
     except Exception:
       pass
 
-  def add(self, wall_ms, cpu_ms) -> None:
+  def add(self, wall_ms, cpu_ms, t_start=None, t_end=None) -> None:
     try:
       # 두 값 변환을 모두 끝낸 뒤에 append — 한쪽만 실패해서 wall/cpu 버퍼 길이가
       # 어긋나는 일이 없게 한다 (paired append)
       wall = max(0.0, float(wall_ms))
       cpu = max(0.0, float(cpu_ms))
+      now = time.monotonic()
       if self._t0 is None:
-        self._t0 = time.monotonic()
+        self._t0 = t_start if t_start is not None else now
+      self._t1 = t_end if t_end is not None else now
       self._wall.append(wall)
       self._cpu.append(cpu)
       if len(self._wall) >= self._window:
@@ -79,6 +84,7 @@ class SectionMetrics:
       self._wall = []
       self._cpu = []
       self._t0 = None
+      self._t1 = None
 
   def _emit(self) -> None:
     try:
@@ -91,12 +97,14 @@ class SectionMetrics:
         phase = "/".join(str(x) for x in phase)
       phase_s = f" phase={phase}" if phase is not None else ""
       t0 = self._t0 if self._t0 is not None else 0.0
+      t1 = self._t1 if self._t1 is not None else t0  # 마지막 샘플 종료 시각 (emit 시각 아님)
       wall_s = f"wall mean={sum(w) / n:.2f} p50={w[i50]:.2f} p95={w[i95]:.2f} max={w[-1]:.2f}"
       cpu_s = f"cpu mean={sum(c) / n:.2f} p50={c[i50]:.2f} p95={c[i95]:.2f} max={c[-1]:.2f}"
-      cloudlog.warning(f"PLOTPERF {self._name}:{phase_s} n={n} t0={t0:.1f} t1={time.monotonic():.1f} {wall_s} | {cpu_s}")
+      cloudlog.warning(f"PLOTPERF {self._name}:{phase_s} n={n} t0={t0:.1f} t1={t1:.1f} {wall_s} | {cpu_s}")
     except Exception:
       pass  # 계측 로그 실패로 렌더 루프를 중단시키지 않는다
     finally:
       self._wall = []
       self._cpu = []
       self._t0 = None
+      self._t1 = None

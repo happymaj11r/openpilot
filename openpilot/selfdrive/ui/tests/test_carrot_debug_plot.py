@@ -195,3 +195,38 @@ class TestBackendLog:
     monkeypatch.setattr(dp, "cloudlog", types.SimpleNamespace(warning=boom))
     p._draw_series(RECT, 0, COLOR, stroke=3)  # _batch_warned 경고 실패도 무전파
     assert len(fake.line_calls) == (PLOT_MAX - 1) * 3
+
+
+class TestPlotOffFlush:
+  """plot OFF(D→E) 전환 시 마지막 부분 윈도가 early return 전에 배출돼야 한다."""
+
+  def test_mode_off_flushes_partial_window(self, monkeypatch):
+    import openpilot.system.ui.lib.carrot_render_metrics as crm
+    from openpilot.system.ui.lib.carrot_render_metrics import SectionMetrics
+    logs = []
+    monkeypatch.setattr(crm, "cloudlog", types.SimpleNamespace(warning=logs.append))
+    monkeypatch.setattr(dp, "plot_sched_gate", types.SimpleNamespace(effective_mode=0))
+    monkeypatch.setattr(dp, "gui_app", types.SimpleNamespace(recording_phase=lambda: (False, 0)))
+
+    p = object.__new__(DebugPlot)
+    p._plot_metrics = SectionMetrics("debugPlot", window=100)
+    p._plot_metrics.set_phase((1, False, 0))
+    p._plot_metrics.add(1.0, 1.0)  # plot 활성 중 남은 부분 샘플
+
+    p._render(RECT)  # mode 0 — early return이지만 phase 전환 flush는 일어나야 한다
+    assert len(logs) == 1
+    assert "phase=1/False/0" in logs[0] and "n=1" in logs[0]
+
+  def test_mode_off_repeated_render_no_further_logs(self, monkeypatch):
+    import openpilot.system.ui.lib.carrot_render_metrics as crm
+    from openpilot.system.ui.lib.carrot_render_metrics import SectionMetrics
+    logs = []
+    monkeypatch.setattr(crm, "cloudlog", types.SimpleNamespace(warning=logs.append))
+    monkeypatch.setattr(dp, "plot_sched_gate", types.SimpleNamespace(effective_mode=0))
+    monkeypatch.setattr(dp, "gui_app", types.SimpleNamespace(recording_phase=lambda: (False, 0)))
+
+    p = object.__new__(DebugPlot)
+    p._plot_metrics = SectionMetrics("debugPlot", window=100)
+    for _ in range(5):
+      p._render(RECT)  # 동일 phase(0, False, 0) 유지 — 추가 배출 없음
+    assert logs == []

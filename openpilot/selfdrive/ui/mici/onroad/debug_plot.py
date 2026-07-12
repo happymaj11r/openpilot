@@ -350,6 +350,9 @@ class DebugPlot(Widget):
     # 스케줄러 강등이 검증된 경우에만 0이 아닌 값 (fail-closed, route 416) —
     # 파라미터 직접 읽기 금지, 게이트가 변경 감지로 갱신한다
     show_plot_mode = plot_sched_gate.effective_mode
+    # phase 전환은 early return보다 먼저 — plot OFF(D→E) 시 마지막 부분 윈도가
+    # 다음 활성화까지 남거나 유실되지 않고 즉시 배출된다. 세션 ID로 60초 회전도 분리
+    self._plot_metrics.set_phase((show_plot_mode, *gui_app.recording_phase()))
     if show_plot_mode == 0:
       return
 
@@ -362,8 +365,6 @@ class DebugPlot(Widget):
       self._reset_plot()
       self.show_plot_mode_prev = show_plot_mode
 
-    # 단계(모드/녹화) 경계가 한 집계 윈도에 섞이지 않게 phase 키로 분리
-    self._plot_metrics.set_phase((show_plot_mode, gui_app.is_recording()))
     _tok = self._plot_metrics.begin()
 
     # === full-area layout (use entire rect) ===
