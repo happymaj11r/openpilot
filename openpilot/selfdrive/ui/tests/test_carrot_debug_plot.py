@@ -48,6 +48,7 @@ def make_plot(monkeypatch, *, has_spline, has_strip, plot_index=137, plot_size=P
   monkeypatch.setattr(dp, "_HAS_SPLINE", has_spline)
   monkeypatch.setattr(dp, "_HAS_LINE_STRIP", has_strip)
   monkeypatch.setattr(dp, "_batch_warned", False)
+  monkeypatch.setattr(dp, "_backend_logged", True)  # backend 로그는 전용 테스트에서만
 
   p = object.__new__(DebugPlot)
   p.plot_size = plot_size
@@ -136,3 +137,30 @@ class TestBatchDrawing:
     p.plot_dx = 3.0
     p._update_x_cache()
     assert p._xs[1] == p.plot_x + 3.0
+
+
+class TestBackendLog:
+  """실제 선택된 batch backend를 프로세스 수명당 정확히 1회만 로그해야 한다."""
+
+  def _run(self, monkeypatch, has_spline, has_strip):
+    p, _ = make_plot(monkeypatch, has_spline=has_spline, has_strip=has_strip)
+    warnings = []
+    monkeypatch.setattr(dp, "cloudlog", types.SimpleNamespace(warning=warnings.append))
+    monkeypatch.setattr(dp, "_backend_logged", False)
+    p._draw_series(RECT, 0, COLOR, stroke=3)
+    p._draw_series(RECT, 1, COLOR, stroke=3)  # 두 번째 호출은 로그 없어야 함
+    return [w for w in warnings if "PLOTDRAW: backend=" in w]
+
+  def test_spline_logged_once(self, monkeypatch):
+    logs = self._run(monkeypatch, True, True)
+    assert len(logs) == 1
+    assert "backend=spline" in logs[0]
+    assert "points=300" in logs[0] and "series=3" in logs[0] and "stroke=3" in logs[0]
+
+  def test_line_strip_logged_once(self, monkeypatch):
+    logs = self._run(monkeypatch, False, True)
+    assert len(logs) == 1 and "backend=line_strip" in logs[0]
+
+  def test_legacy_logged_once(self, monkeypatch):
+    logs = self._run(monkeypatch, False, False)
+    assert len(logs) == 1 and "backend=legacy" in logs[0]

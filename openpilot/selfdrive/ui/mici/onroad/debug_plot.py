@@ -7,6 +7,7 @@ import pyray as rl
 from openpilot.common.swaglog import cloudlog
 from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.lib.application import gui_app, FontWeight
+from openpilot.system.ui.lib.carrot_render_metrics import SectionMetrics
 from openpilot.selfdrive.ui.carrot_plot_sched import plot_sched_gate
 from openpilot.selfdrive.ui.ui_state import ui_state
 
@@ -18,6 +19,7 @@ PLOT_MAX = 300
 _HAS_SPLINE = hasattr(rl, "draw_spline_linear")
 _HAS_LINE_STRIP = hasattr(rl, "draw_line_strip")
 _batch_warned = False
+_backend_logged = False
 
 
 def _safe_get(obj, path: str, default=0.0):
@@ -80,6 +82,8 @@ class DebugPlot(Widget):
     self._xs = [0.0] * PLOT_MAX
     self._xs_key: tuple[float, float] | None = None
     self._title_cached = "no data"
+    # wall/cpu 분리 계측 — SCHED_OTHER 강등 후 선점 대기와 실제 렌더 비용 구분용
+    self._plot_metrics = SectionMetrics("debugPlot")
 
     # plot state
     self.plot_size = 0
@@ -246,6 +250,14 @@ class DebugPlot(Widget):
       self._xs_key = key
 
   def _draw_series(self, rect: rl.Rectangle, series_idx: int, color: rl.Color, stroke: int = 3):
+    # 실제 선택된 backend를 프로세스 수명당 1회만 기록 (성능 분석용, 매 프레임 금지)
+    global _backend_logged
+    if not _backend_logged:
+      _backend_logged = True
+      backend = "spline" if _HAS_SPLINE else ("line_strip" if _HAS_LINE_STRIP else "legacy")
+      ver = getattr(rl, "RAYLIB_VERSION", "?")
+      cloudlog.warning(f"PLOTDRAW: backend={backend} points={PLOT_MAX} series=3 stroke={stroke} raylib={ver}")
+
     n = self.plot_size
     if n < 2:
       return
@@ -342,6 +354,8 @@ class DebugPlot(Widget):
       self._reset_plot()
       self.show_plot_mode_prev = show_plot_mode
 
+    _tok = self._plot_metrics.begin()
+
     # === full-area layout (use entire rect) ===
     rx = float(rect.x)
     ry = float(rect.y)
@@ -431,3 +445,5 @@ class DebugPlot(Widget):
 
     for i in range(3):
       self._draw_series(rect, i, colors[i], stroke=3)
+
+    self._plot_metrics.end(_tok)

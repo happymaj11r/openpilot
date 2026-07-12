@@ -12,6 +12,7 @@ from openpilot.selfdrive.ui.mici.onroad.model_renderer import ModelRenderer
 from openpilot.selfdrive.ui.mici.onroad.confidence_ball import ConfidenceBall
 from openpilot.selfdrive.ui.mici.onroad.cameraview import CameraView
 from openpilot.system.ui.lib.application import FontWeight, gui_app, MousePos, MouseEvent
+from openpilot.system.ui.lib.carrot_render_metrics import SectionMetrics
 from openpilot.system.ui.widgets.label import UnifiedLabel
 from openpilot.system.ui.widgets import Widget
 from openpilot.common.filter_simple import BounceFilter, FirstOrderFilter
@@ -175,6 +176,9 @@ class AugmentedRoadView(CameraView):
 
     # debug
     self._pm = messaging.PubMaster(['uiDebug'])
+    # wall/cpu 분리 계측 — drawTimeMillis(wall)만으로는 SCHED_OTHER 선점 대기와
+    # 실제 렌더 비용을 구분할 수 없다 (route 418 진단)
+    self._render_metrics = SectionMetrics("uiRender")
 
   def is_swiping_left(self) -> bool:
     """Check if currently swiping left (for scroller to disable)."""
@@ -198,6 +202,7 @@ class AugmentedRoadView(CameraView):
 
   def _render(self, _):
     start_draw = time.monotonic()
+    _tok = self._render_metrics.begin()
     self._switch_stream_if_needed(ui_state.sm)
 
     # Update calibration before rendering
@@ -276,6 +281,7 @@ class AugmentedRoadView(CameraView):
       rl.draw_circle(x, y, 6, rl.Color(255, 0, 0, 220))
 
     # publish uiDebug
+    self._render_metrics.end(_tok)
     msg = messaging.new_message('uiDebug')
     msg.uiDebug.drawTimeMillis = (time.monotonic() - start_draw) * 1000
     self._pm.send('uiDebug', msg)

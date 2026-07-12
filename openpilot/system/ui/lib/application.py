@@ -20,6 +20,7 @@ from typing import NamedTuple
 from importlib.resources import as_file
 from openpilot.common.basedir import BASEDIR
 from openpilot.common.swaglog import cloudlog
+from openpilot.system.ui.lib.carrot_render_metrics import SectionMetrics
 from openpilot.system.hardware import HARDWARE, PC
 from openpilot.system.ui.lib.multilang import multilang
 from openpilot.common.realtime import Ratekeeper
@@ -312,6 +313,8 @@ class GuiApplication:
     # 라이터 스레드의 비정상 종료 신호 — 인코더 프로세스가 살아 있어도(예: kill 실패,
     # stdin write 예외) 렌더 루프가 실패를 감지할 수 있게 한다. 세션마다 새 객체로 교체.
     self._record_failure_event = threading.Event()
+    # 캡처(동기 GPU readback) 구간의 wall/cpu 분리 계측 (route 418 진단)
+    self._capture_metrics = SectionMetrics("screenCapture")
 
   def _new_record_path(self) -> Path:
     self._record_dir.mkdir(parents=True, exist_ok=True)
@@ -997,14 +1000,20 @@ class GuiApplication:
         if RECORD or self._record_enabled:
           self._record_frame_idx += 1
           if self._record_frame_idx % self._record_every_n == 0:
+            # 동기식 GPU readback: rlReadTexturePixels가 캡처마다 임시 FBO 생성/해제
+            # (rlog의 "FBO: Unloaded framebuffer" 반복) + ~9MB 이미지 할당 + bytes 복사.
+            # 개선 방향 선택을 위해 wall/cpu를 분리 계측한다 (carrot 녹화 경로만)
+            cap_tok = SectionMetrics.begin() if self._record_enabled else None
             image = rl.load_image_from_texture(self._render_texture.texture)
             data_size = image.width * image.height * 4
             data = bytes(rl.ffi.buffer(image.data, data_size))
             try:
               self._ffmpeg_queue.put_nowait(data)  # Async write via background thread
             except queue.Full:
-              pass          
+              pass
             rl.unload_image(image)
+            if cap_tok is not None:
+              self._capture_metrics.end(cap_tok)
             
           if self._record_enabled:
             if (self._record_failure_event.is_set()
