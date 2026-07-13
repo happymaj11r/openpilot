@@ -5,6 +5,9 @@ route 41d 후속(pooled buffer ①안 + rotation/stop stall 제거)의 리뷰 �
 cleanup 강등 fail-closed, cleanup start 실패 동기 fallback, 앱 종료 reap,
 deferred start의 ScreenRecord 상태 계약.
 """
+import ast
+import inspect
+import os
 import queue
 import subprocess
 import threading
@@ -180,6 +183,85 @@ class TestStdinWriteAll:
       raise AssertionError("must propagate")
     except BrokenPipeError:
       pass
+
+  def test_out_of_contract_count_raises(self):
+    # 음수/초과 보고는 실제 FileIO 계약 밖 — 성공으로 오인해 memoryview를 잘못
+    # 소비(음수 슬라이스/조기 완료 판정)하면 안 된다
+    for bogus in (-1, 3):
+      stdin = types.SimpleNamespace(write=lambda mv, _n=bogus: _n)
+      try:
+        _record_stdin_write_all(stdin, bytearray(b"xx"))  # len 2 < 3
+        raise AssertionError("invalid count must raise")
+      except OSError:
+        pass
+
+  def test_real_raw_pipe_delivers_all_bytes(self):
+    # 실제 FileIO/파이프 통합 검증 — 파이프 용량(통상 64KiB)보다 큰 프레임은
+    # partial write가 실제로 발생하므로 write-all 루프가 실전 계약으로 검증된다
+    r_fd, w_fd = os.pipe()
+    received = bytearray()
+    def drain():
+      with open(r_fd, "rb", buffering=0) as r:
+        while True:
+          b = r.read(65536)
+          if not b:
+            break
+          received.extend(b)
+    reader = threading.Thread(target=drain)
+    reader.start()
+    data = bytes(range(256)) * 4096  # 1 MiB
+    try:
+      with open(w_fd, "wb", buffering=0) as w:  # raw FileIO — 인코더 stdin과 동일 계층
+        _record_stdin_write_all(w, data)
+    finally:
+      reader.join(timeout=30)
+    assert not reader.is_alive() and bytes(received) == data
+
+
+class TestUpstreamRecordWriter:
+  # upstream RECORD(개발용) writer도 raw stdin 전제를 공유한다 — 공유 teardown의
+  # raw close 계약이 모든 호출부에서 성립해야 하므로 write도 전량 쓰기여야 하고,
+  # 실패 시에는 기존 의미(첫 실패에서 곧장 종료)를 유지해야 한다
+
+  def _writer_app(self, stdin):
+    q = queue.Queue()
+    proc = types.SimpleNamespace(stdin=stdin)
+    app = make_app(_ffmpeg_queue=q, _ffmpeg_proc=proc, _ffmpeg_stop_event=threading.Event())
+    return app, q
+
+  def test_partial_writes_deliver_full_frame(self):
+    chunks = []
+    def partial_write(mv):
+      n = min(7, len(mv))  # 파이프가 7바이트씩만 받는 상황
+      chunks.append(bytes(mv[:n]))
+      return n
+    app, q = self._writer_app(types.SimpleNamespace(write=partial_write))
+    frame = bytes(range(64))
+    q.put(frame)
+    q.put(None)  # 정지 sentinel — 정상 종료로 반환해야 한다
+    app._ffmpeg_writer_thread()
+    assert b"".join(chunks) == frame
+
+  def test_no_progress_stops_writer(self):
+    # 진행 불가(0/None)는 write-all이 예외로 승격 → 기존 except-break 의미대로
+    # 첫 실패에서 writer가 끝난다 (무한 재시도/이후 프레임 계속 쓰기 금지)
+    for stall in (0, None):
+      calls = []
+      stdin = types.SimpleNamespace(write=lambda mv, _s=stall, _c=calls: _c.append(1) or _s)
+      app, q = self._writer_app(stdin)
+      q.put(b"first")
+      q.put(b"second")
+      app._ffmpeg_writer_thread()  # 예외가 밖으로 새면 테스트 실패
+      assert len(calls) == 1 and q.qsize() == 1
+
+  def test_write_exception_stops_writer(self):
+    def boom(_mv):
+      raise BrokenPipeError("pipe closed")
+    app, q = self._writer_app(types.SimpleNamespace(write=boom))
+    q.put(b"first")
+    q.put(b"second")
+    app._ffmpeg_writer_thread()  # 기존 except-break 의미 보존 — 예외 없이 반환
+    assert q.qsize() == 1
 
 
 class TestCaptureNoThrow:
@@ -857,6 +939,24 @@ class TestRawStdinNoNestedThread:
     assert app._init_ffmpeg(Path("/tmp/x.mp4")) is True
     assert captured.get("bufsize") == 0 and captured.get("stdin") is subprocess.PIPE
     assert started == [1]
+
+  def test_every_module_popen_is_unbuffered(self):
+    # 공유 teardown은 stdin을 raw로 가정하고 close(2) 한 번으로 닫는다 — 이 전제는
+    # 모듈의 모든 인코더 Popen(carrot _init_ffmpeg + upstream RECORD init_window)이
+    # bufsize=0일 때만 성립한다. buffered stdin 재도입을 소스 레벨에서 봉쇄한다.
+    tree = ast.parse(inspect.getsource(app_mod))
+    popen_calls = [
+      node for node in ast.walk(tree)
+      if isinstance(node, ast.Call)
+      and ((isinstance(node.func, ast.Attribute) and node.func.attr == "Popen")
+           or (isinstance(node.func, ast.Name) and node.func.id == "Popen"))
+    ]
+    assert len(popen_calls) >= 2, "carrot과 upstream RECORD의 Popen 호출부가 모두 있어야 한다"
+    for call in popen_calls:
+      kws = {k.arg: k.value for k in call.keywords}
+      buf = kws.get("bufsize")
+      assert isinstance(buf, ast.Constant) and buf.value == 0, \
+        f"line {call.lineno}: Popen에 bufsize=0 누락 — 공유 teardown의 raw close 전제 위반"
 
 
 class TestCloseWindowIndependence:

@@ -268,15 +268,18 @@ class _DeadThreadMarker:
 
 def _record_stdin_write_all(stdin, data) -> None:
   """unbuffered(raw) 인코더 stdin에 전량 쓴다 — raw write는 partial일 수 있어
-  반복한다. 진행 불가(None/0)나 예외는 그대로 올려 writer가 비정상 종료로
-  처리한다. (buffered stdin을 쓰지 않는 이유: flush/close가 timeout 없이 무한
-  블록할 수 있어 종료 경로에 별도 closer 스레드가 필요해지고, 그 스레드의
-  스케줄러/수명 관리가 다시 unbounded가 된다 — raw는 close가 close(2) 한 번.)"""
+  반복한다. 진행 불가(None/0)·계약 밖 반환(음수/초과 보고)이나 예외는 그대로
+  올려 writer가 비정상 종료로 처리한다. (buffered stdin을 쓰지 않는 이유:
+  flush/close가 timeout 없이 무한 블록할 수 있어 종료 경로에 별도 closer
+  스레드가 필요해지고, 그 스레드의 스케줄러/수명 관리가 다시 unbounded가
+  된다 — raw는 close가 close(2) 한 번.)"""
   mv = memoryview(data)
   while len(mv) > 0:
     n = stdin.write(mv)
-    if not n:
-      raise OSError("record stdin write made no progress")
+    if n is None or n <= 0 or n > len(mv):
+      # 진행 불가나 계약 밖 count를 성공으로 오인하면 무한 루프하거나
+      # 미전송분을 전송된 것으로 집계한다 — 예외로 승격
+      raise OSError(f"record stdin write returned invalid count: {n!r}")
     mv = mv[n:]
 
 
@@ -864,7 +867,11 @@ class GuiApplication:
           '-f', 'mp4',              # Output format
           RECORD_OUTPUT,            # Output file path
         ]
-        self._ffmpeg_proc = subprocess.Popen(ffmpeg_args, stdin=subprocess.PIPE)
+        # bufsize=0: raw(unbuffered) stdin — 종료가 carrot 경로와 같은 공유
+        # teardown(_record_teardown)을 타므로, buffered stdin이면 close()의 내부
+        # flush가 timeout 없이 블록할 수 있다. raw는 close가 close(2) 한 번.
+        # (partial write는 writer의 _record_stdin_write_all이 처리)
+        self._ffmpeg_proc = subprocess.Popen(ffmpeg_args, stdin=subprocess.PIPE, bufsize=0)
         self._ffmpeg_queue = queue.Queue(maxsize=60)  # Buffer up to 60 frames
         self._ffmpeg_stop_event = threading.Event()
         self._ffmpeg_thread = threading.Thread(target=self._ffmpeg_writer_thread, daemon=True)
@@ -921,7 +928,7 @@ class GuiApplication:
         data = self._ffmpeg_queue.get(timeout=1.0)
         if data is None:  # Sentinel to stop
           break
-        self._ffmpeg_proc.stdin.write(data)
+        _record_stdin_write_all(self._ffmpeg_proc.stdin, data)  # raw stdin — partial 가능, 전량 쓰기
       except queue.Empty:
         if self._ffmpeg_stop_event.is_set():
           break
@@ -1224,8 +1231,10 @@ class GuiApplication:
           pass
         return cls._record_proc_dead(proc)
       try:
-        # stdin은 raw(unbuffered, _init_ffmpeg의 bufsize=0) — close는 close(2) 한
-        # 번이라 블록하지 않고 곧장 EOF가 전달된다 (flush할 userspace 버퍼 없음).
+        # stdin은 raw(unbuffered) — 이 teardown을 타는 모든 인코더 Popen(carrot
+        # _init_ffmpeg·upstream RECORD init_window)이 bufsize=0이다. close는
+        # close(2) 한 번이라 블록하지 않고 곧장 EOF가 전달된다 (flush할
+        # userspace 버퍼 없음).
         # writer는 위 join으로 종료가 확인된 뒤라 동시 접근도 없다. 예외가 나면
         # EOF 전달 실패이므로 바깥 except의 kill 체인으로 떨어진다.
         stdin = getattr(proc, "stdin", None)
@@ -1439,7 +1448,8 @@ class GuiApplication:
               # carrot 녹화: pooled buffer 캡처 (bytes 생성/GC 제거, route 41d ①안)
               self._capture_record_frame()
             else:
-              # upstream RECORD(개발용) 경로 — 무수정: bytes 복사 + upstream writer
+              # upstream RECORD(개발용) 경로 — bytes 복사 + upstream writer 유지
+              # (stdin 계층만 raw/write-all로 통일: 공유 teardown의 raw close 전제)
               image = rl.load_image_from_texture(self._render_texture.texture)
               data_size = image.width * image.height * 4
               data = bytes(rl.ffi.buffer(image.data, data_size))
