@@ -99,10 +99,22 @@ class TestHudPlotBatch:
     p._draw_plotting(0, 350.0, 40.0, object(), None)
     assert not calls["polyline"] and not calls["text"]
 
-  def test_backend_logged_via_helper(self, monkeypatch):
+  def test_backend_log_not_called_in_draw_path(self, monkeypatch):
+    # PLOTDRAW cloudlog가 첫 plot 프레임의 drawTime/uiRender를 오염시키면 안 된다 —
+    # draw 경로에서는 이월 표시만 하고 실제 로그는 emit_pending_metrics()에서
     p, calls = make_renderer(monkeypatch)
+    p._backend_log_pending = False
     p._draw_plotting(0, 350.0, 40.0, object(), None)
-    assert calls["backend"] == [(PLOT_MAX, 3, 3)]
+    assert calls["backend"] == []
+    assert p._backend_log_pending is True
+
+  def test_backend_logged_on_emit_with_args(self, monkeypatch):
+    p, calls = make_renderer(monkeypatch)
+    p._backend_log_pending = False
+    p._plot_metrics = SectionMetrics("debugPlot", window=100, deferred=True)
+    p._draw_plotting(0, 350.0, 40.0, object(), None)
+    p.emit_pending_metrics()
+    assert calls["backend"] == [(PLOT_MAX, 3, 3)]  # 인자 보존 (points/series/stroke)
 
   def test_helper_end_to_end_spline(self, monkeypatch):
     # hud.plot_draw를 fake로 바꾸지 않고 실제 공용 헬퍼를 경유 — big-UI가 spline
@@ -139,15 +151,19 @@ def _capture_logs(monkeypatch):
   return logs
 
 
-def make_wired(monkeypatch, *, mode=1, window=100):
-  """draw() 레벨 wiring 테스트용 — 전역 의존은 stub, 필드/계측은 실물."""
+def make_wired(monkeypatch, *, mode=1, window=100, real_helper=False):
+  """draw() 레벨 wiring 테스트용 — 전역 의존은 stub, 필드/계측은 실물.
+
+  real_helper=True면 hud.plot_draw를 실제 공용 헬퍼로 두고(cpd.rl/cloudlog만 fake)
+  PLOTDRAW 이월/1회 보장을 실제 로깅 경로로 검증할 수 있다."""
   state = {"mode": mode, "rec": (False, 0)}
   monkeypatch.setattr(hud, "plot_sched_gate", FakeGate(state))
   monkeypatch.setattr(hud, "gui_app", types.SimpleNamespace(recording_phase=lambda: state["rec"]))
   monkeypatch.setattr(hud, "ui_state", types.SimpleNamespace(
     sm=types.SimpleNamespace(alive={"carState": True, "longitudinalPlan": True})))
-  monkeypatch.setattr(hud, "plot_draw", types.SimpleNamespace(
-    log_backend_once=lambda *a: None, draw_polyline=lambda *a, **k: None))
+  if not real_helper:
+    monkeypatch.setattr(hud, "plot_draw", types.SimpleNamespace(
+      log_backend_once=lambda *a: None, draw_polyline=lambda *a, **k: None))
   monkeypatch.setattr(hud, "draw_text_ui_style", lambda *a, **k: None)
 
   p = object.__new__(PlotRenderer)
@@ -158,6 +174,7 @@ def make_wired(monkeypatch, *, mode=1, window=100):
   p._plot_x, p._plot_y = 350.0, 40.0
   p._plot_height, p._plot_dx = 300.0, 2.0
   p._pts = [FakeVec() for _ in range(PLOT_MAX)]
+  p._backend_log_pending = False
   p._plot_metrics = SectionMetrics("debugPlot", window=window, deferred=True)
   p._make_plot_data = lambda sm, mode: ([0.1, 0.2, 0.3], "T")
   rect = types.SimpleNamespace(width=1400.0, x=0.0, y=0.0)
@@ -235,3 +252,24 @@ class TestHudPlotWiring:
     hr._plot_renderer = types.SimpleNamespace(emit_pending_metrics=lambda: called.append(1))
     hr.emit_pending_plot_metrics()
     assert called == [1]
+
+  def test_backend_log_deferred_and_once_real_helper(self, monkeypatch):
+    # 실제 헬퍼 로깅을 살린 채(1회 가드 리셋) 첫 B 프레임 시나리오 재현:
+    # draw() 안 cloudlog 0 → emit_pending_metrics()에서 PLOTDRAW 정확히 1회 →
+    # 재 draw+emit에도 추가 PLOTDRAW 없음 (헬퍼 프로세스 가드)
+    perf_logs = _capture_logs(monkeypatch)  # PLOTPERF (crm.cloudlog)
+    helper_logs = []
+    monkeypatch.setattr(cpd, "cloudlog", types.SimpleNamespace(warning=helper_logs.append))
+    monkeypatch.setattr(cpd, "_backend_logged", False)
+    monkeypatch.setattr(cpd, "HAS_SPLINE", True)
+    monkeypatch.setattr(cpd, "rl", types.SimpleNamespace(
+      draw_spline_linear=lambda pts, n, thick, color: None))
+
+    p, state, rect = make_wired(monkeypatch, real_helper=True)
+    p.draw(rect, None)  # 첫 plot 프레임
+    assert helper_logs == [] and perf_logs == []  # draw 경로 어디서도 cloudlog 금지
+    p.emit_pending_metrics()
+    assert len(helper_logs) == 1 and helper_logs[0].startswith("PLOTDRAW: backend=spline")
+    p.draw(rect, None)
+    p.emit_pending_metrics()
+    assert len(helper_logs) == 1  # 추가 PLOTDRAW 없음

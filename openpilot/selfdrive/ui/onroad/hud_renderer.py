@@ -1213,6 +1213,9 @@ class PlotRenderer:
     # batch 드로잉용 재사용 버퍼 — 기존 per-segment draw_line_ex는 프레임당 최대
     # 1,197콜 + Vector2 ~1,200개 할당으로 UI CPU를 크게 소비했다 (route 41a)
     self._pts = [rl.Vector2(0, 0) for _ in range(self.PLOT_MAX)]
+    # PLOTDRAW backend 로그 이월 표시 — draw()가 uiRender/drawTimeMillis 안에
+    # 중첩이라 로그는 emit_pending_metrics()에서만 (실제 1회 보장은 헬퍼 내부 가드)
+    self._backend_log_pending = False
     # wall/cpu 분리 계측 — 선점 대기와 실제 렌더 비용 구분 (window 100 ≈ 저FPS에서도
     # 짧은 진단 단계 안에 clean 윈도 확보). big-UI는 draw()가 uiRender/drawTimeMillis
     # 측정 안에 중첩되므로 deferred — draw() 안에서는 pending 이동만 하고, 실제
@@ -1376,7 +1379,10 @@ class PlotRenderer:
     if n <= 0:
       return
 
-    plot_draw.log_backend_once(self.PLOT_MAX, 3, 3)
+    # backend 로그(PLOTDRAW)도 draw 경로에서는 표시만 — cloudlog는 첫 plot 프레임의
+    # drawTime/uiRender/debugPlot 샘플을 오염시키므로 emit_pending_metrics()에서 배출
+    # (mici는 비중첩이라 log_backend_once 즉시 호출 유지)
+    self._backend_log_pending = True
 
     plot_range = self._plot_max - self._plot_min
     plot_ratio = self._plot_height if plot_range < 1.0 else (self._plot_height / plot_range)
@@ -1451,7 +1457,11 @@ class PlotRenderer:
     self._plot_metrics.end(_tok)
 
   def emit_pending_metrics(self) -> None:
-    """완성된 계측 윈도의 실제 로그 배출. draw()는 uiRender/drawTimeMillis 측정 안에
-    중첩돼 있어 로그를 쓰면 바깥 지표에 주기적 spike가 찍힌다 — 반드시 바깥 구간
-    종료 후(augmented_road_view에서 uiRender.end() 뒤)에 호출할 것."""
+    """이월된 로그(PLOTDRAW backend 1회 + 완성 계측 윈도)의 실제 배출. draw()는
+    uiRender/drawTimeMillis 측정 안에 중첩돼 있어 로그를 쓰면 바깥 지표에 spike가
+    찍힌다 — 반드시 바깥 구간 종료 후(augmented_road_view에서 uiRender.end() 뒤)에
+    호출할 것."""
+    if self._backend_log_pending:
+      self._backend_log_pending = False
+      plot_draw.log_backend_once(self.PLOT_MAX, 3, 3)
     self._plot_metrics.emit_pending()
