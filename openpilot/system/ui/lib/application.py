@@ -320,6 +320,16 @@ class GuiApplication:
     # 녹화 세션 카운터 — 60초 회전은 같은 프레임에 stop→start라 recording bool만으로는
     # 계측 phase가 구분되지 않는다. 시작 성공마다 증가시켜 회전 전후를 분리한다
     self._record_session_id = 0
+    # 캡처 프레임 재사용 버퍼 풀 — 캡처마다 ~9MB bytes 생성/GC가 capture cpu의
+    # 주성분이었다(route 41d: cpu p50 7.5ms). 상한 고정: 평시 큐 깊이는 0~1이므로
+    # 6개면 충분하고, 고갈 = 인코더 밀림 → 프레임 드랍이 정답 (무제한 버퍼링 금지)
+    self._record_buf_count = 6
+    self._record_buf_pool: queue.Queue | None = None
+    self._record_buf_size = 0
+    # 비동기 인코더 정리 스레드(60초 회전/stop에서 UI 스레드의 428/538ms 정지 제거,
+    # route 41d) — bounded: 2개 이상 밀리면 새 녹화 시작을 미룬다
+    self._record_cleanup_threads: list[threading.Thread] = []
+    self._record_start_deferred_logged = False
 
   def _new_record_path(self) -> Path:
     self._record_dir.mkdir(parents=True, exist_ok=True)
@@ -337,9 +347,23 @@ class GuiApplication:
     if self._record_fail_count >= 3 and (time.monotonic() - self._record_fail_t) < 60.0:
       return
 
+    # 이전 세션의 비동기 정리가 밀려 있으면 시작을 미룬다 (bounded async cleanup).
+    # 60초 회전에서 직전 세션 정리 1개가 진행 중인 것은 정상 — 2개 이상이면 인코더가
+    # 계속 안 죽는 비정상이므로 새 인코더를 더 띄우지 않는다 (MainLayout이 매 프레임
+    # 재시도하므로 정리가 끝나면 자동 재개)
+    self._record_cleanup_threads = [t for t in self._record_cleanup_threads if t.is_alive()]
+    if len(self._record_cleanup_threads) >= 2:
+      if not self._record_start_deferred_logged:
+        self._record_start_deferred_logged = True
+        print("[REC] previous encoder cleanups still pending, deferring start")
+      return
+    self._record_start_deferred_logged = False
+
     self._ensure_render_texture_for_recording()
     if not self._render_texture:
       return
+    tex = self._render_texture.texture
+    self._ensure_record_buf_pool(tex.width * tex.height * 4)
 
     out_path = self._new_record_path()
     if not self._init_ffmpeg(out_path):
@@ -357,10 +381,12 @@ class GuiApplication:
     if not self._record_enabled:
       return
     self._record_enabled = False
-    # 부분 윈도 배출은 blocking인 close_ffmpeg(최대 수십 초)보다 먼저 — 로그가
-    # 단계 경계 시점에 즉시 남고, 다음 녹화(60초 회전 포함)와 집계가 섞이지 않는다
+    # 부분 윈도 배출은 인코더 정리보다 먼저 — 로그가 단계 경계 시점에 즉시 남고,
+    # 다음 녹화(60초 회전 포함)와 집계가 섞이지 않는다 (flush-before-close 계약)
     self._capture_metrics.flush()
-    self.close_ffmpeg()  # application.py에 이미 있는 close_ffmpeg 그대로 사용
+    # blocking 정리(writer join/stdin close/proc wait)는 백그라운드로 — 동기로 하면
+    # 60초 회전에서 ~428ms, stop에서 ~538ms UI 프레임 정지가 생긴다 (route 41d)
+    self._close_ffmpeg_async()
     print("[REC] stop")
 
   def toggle_recording(self):
@@ -381,6 +407,63 @@ class GuiApplication:
     if self._render_texture is None:
       self._render_texture = rl.load_render_texture(self._width, self._height)
       rl.set_texture_filter(self._render_texture.texture, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)
+
+  def _ensure_record_buf_pool(self, data_size: int) -> None:
+    """캡처 재사용 버퍼 풀 준비 — 프로세스 수명 재사용(회전마다 재할당하면 zero-fill
+    수십 ms가 회전 프레임에 더해진다). writer 비정상 종료로 소실된 버퍼는 여기서
+    보충하고, 상한은 풀 maxsize가 보장한다(늦게 반환된 초과분은 폐기)."""
+    if self._record_buf_pool is None or self._record_buf_size != data_size:
+      self._record_buf_pool = queue.Queue(maxsize=self._record_buf_count)
+      self._record_buf_size = data_size
+    pool = self._record_buf_pool
+    while pool.qsize() < self._record_buf_count:
+      try:
+        pool.put_nowait(bytearray(data_size))
+      except queue.Full:
+        break
+
+  def _take_record_buf(self):
+    pool = self._record_buf_pool
+    if pool is None:
+      return None
+    try:
+      return pool.get_nowait()
+    except queue.Empty:
+      return None  # 고갈 = 인코더 밀림 → 이번 캡처 프레임 드랍 (bounded)
+
+  def _return_record_buf(self, buf) -> None:
+    if buf is None:
+      return
+    try:
+      self._record_buf_pool.put_nowait(buf)
+    except Exception:
+      pass  # 풀 없음/상한 초과(이전 세션의 늦은 반환 등) — 폐기해서 상한 유지
+
+  def _capture_record_frame(self) -> None:
+    """carrot 녹화 캡처: GPU readback을 재사용 버퍼로 복사해 인코더 큐에 넘긴다.
+
+    기존 bytes(ffi.buffer(...)) 방식은 캡처마다 ~9MB Python bytes 생성/GC로
+    capture cpu p50 7.5ms의 주성분이었다(route 41d) — ffi.memmove로 재사용
+    bytearray에 복사만 한다. 버퍼 소유권은 큐 투입 성공 시 writer로 넘어가고
+    (writer가 쓰고 풀에 반환), 실패 경로는 전부 여기서 반환한다."""
+    buf = self._take_record_buf()
+    if buf is None:
+      return  # 풀 고갈 — readback 비용도 아끼며 프레임 드랍
+    # readback+복사+해제까지만 계측 — 큐 비용은 캡처 비용이 아니므로 제외
+    cap_tok = SectionMetrics.begin()
+    image = rl.load_image_from_texture(self._render_texture.texture)
+    if image.width * image.height * 4 == len(buf):
+      rl.ffi.memmove(buf, image.data, len(buf))
+      rl.unload_image(image)
+      self._capture_metrics.end(cap_tok)
+      try:
+        self._ffmpeg_queue.put_nowait(buf)
+        buf = None  # 소유권 이동 — writer가 반환
+      except Exception:
+        pass  # 큐 가득/세션 경계 — 프레임 드랍
+    else:
+      rl.unload_image(image)  # 크기 불일치(텍스처 재생성 등) — 샘플/프레임 드랍
+    self._return_record_buf(buf)
 
   @staticmethod
   def _demote_record_sched() -> bool:
@@ -414,8 +497,10 @@ class GuiApplication:
 
   def _record_writer_thread(self):
     # 스레드도 UI의 RT 스케줄링을 상속하므로 시작하자마자 강등 — 실패하면 FIFO 53으로
-    # 프레임을 쓰게 되므로 인코더까지 함께 중단한다 (fail-closed)
+    # 프레임을 쓰게 되므로 인코더까지 함께 중단한다 (fail-closed).
+    # 세션 객체는 전부 지역 참조 — 비동기 정리가 self._ffmpeg_*를 끊어도 안전하다
     proc = self._ffmpeg_proc
+    writer_queue = self._ffmpeg_queue
     stop_event = self._ffmpeg_stop_event
     failure_event = self._record_failure_event
     try:
@@ -452,13 +537,47 @@ class GuiApplication:
             self._kill_record_encoder(proc)
           return
 
-      self._ffmpeg_writer_thread()
+      self._record_writer_loop(proc, writer_queue, stop_event)
     finally:
       # 정지 요청 없이 라이터가 끝났다 = 강등/검증 실패, stdin write 예외 등 비정상 종료.
       # 인코더 프로세스가 살아 있어도(kill 실패 포함) 렌더 루프가 poll() 대신 이 신호로
       # 실패를 감지해 녹화를 멈춘다 (fail-closed). 예상 밖 예외로 죽는 경로까지 포괄한다.
       if stop_event is None or not stop_event.is_set():
         failure_event.set()
+
+  def _record_writer_loop(self, proc, writer_queue, stop_event):
+    """carrot 녹화 writer 본체 — pooled buffer를 쓰고 풀에 반환한다.
+
+    upstream _ffmpeg_writer_thread는 bytes 전용이라(버퍼 반환 없음) RECORD 개발용
+    경로에 남겨 두고, carrot 경로는 여기서 처리한다. 세션 객체는 인자(지역 참조)로만
+    쓴다 — 비동기 정리가 self._ffmpeg_*를 먼저 끊어도 동작이 바뀌지 않는다."""
+    try:
+      while True:
+        try:
+          data = writer_queue.get(timeout=1.0)
+        except queue.Empty:
+          if stop_event.is_set():
+            break
+          continue
+        if data is None:  # 정지 sentinel
+          break
+        ok = True
+        try:
+          proc.stdin.write(data)
+        except Exception:
+          ok = False
+        self._return_record_buf(data)  # write 성공/실패 무관 회수 — 풀 고갈 방지
+        if not ok:
+          break  # 비정상 종료 — 래퍼의 finally가 failure_event로 알린다
+    finally:
+      # 종료 후 큐 잔여 버퍼 회수 — 회수 없이 버리면 실패/정지가 반복될 때
+      # 풀이 말라 이후 세션이 전부 프레임 드랍이 된다
+      while True:
+        try:
+          item = writer_queue.get_nowait()
+        except queue.Empty:
+          break
+        self._return_record_buf(item)
 
   def _init_ffmpeg(self, out_path: Path) -> bool:
     self.close_ffmpeg()
@@ -520,39 +639,6 @@ class GuiApplication:
     self._ffmpeg_thread = threading.Thread(target=self._record_writer_thread, daemon=True)
     self._ffmpeg_thread.start()
     return True
-
-  def close_ffmpeg(self):
-    if self._ffmpeg_thread is not None:
-      self._ffmpeg_stop_event.set()
-      try:
-        self._ffmpeg_queue.put(None, timeout=1.0)
-      except Exception:
-        pass
-      self._ffmpeg_thread.join(timeout=30)
-
-    if self._ffmpeg_proc is not None:
-      try:
-        if self._ffmpeg_proc.stdin:
-          try:
-            self._ffmpeg_proc.stdin.flush()
-          except Exception:
-            pass
-          self._ffmpeg_proc.stdin.close()
-        try:
-          self._ffmpeg_proc.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-          self._ffmpeg_proc.terminate()
-          self._ffmpeg_proc.wait()
-      except Exception:
-        try:
-          self._ffmpeg_proc.kill()
-        except Exception:
-          pass
-
-    self._ffmpeg_proc = None
-    self._ffmpeg_queue = None
-    self._ffmpeg_thread = None
-    self._ffmpeg_stop_event = None  
 
   @property
   def frame(self):
@@ -837,32 +923,73 @@ class GuiApplication:
     rl.unload_image(image)
     return texture
 
-  def close_ffmpeg(self):
+  def _detach_ffmpeg_session(self):
+    """세션 참조를 원자적으로 끊어 지역으로 넘긴다 (재진입/중복 정리 방지).
+    이후 새 세션은 완전히 새 객체(proc/queue/event/thread)를 쓰므로 이전 세션
+    정리와 경합하지 않는다."""
     th = self._ffmpeg_thread
     q = self._ffmpeg_queue
     ev = self._ffmpeg_stop_event
     proc = self._ffmpeg_proc
-
-    # 먼저 참조 끊기(재진입/중복 호출 방지)
     self._ffmpeg_thread = None
     self._ffmpeg_queue = None
     self._ffmpeg_stop_event = None
     self._ffmpeg_proc = None
+    return th, q, ev, proc
 
-    # thread stop
+  @staticmethod
+  def _signal_writer_stop(q, ev) -> None:
+    """writer 정지 신호 — 논블로킹만. stop_event를 sentinel보다 먼저 set해야
+    writer의 finally가 '정지 요청 있음'으로 인식한다 (failure 오인 방지)."""
+    if ev is not None:
+      ev.set()
+    if q is not None:
+      try:
+        q.put_nowait(None)
+      except Exception:
+        pass
+
+  def close_ffmpeg(self):
+    """동기 정리 — 앱 종료/세션 시작 전 safety 경로 전용. 주행 중 stop/60초 회전은
+    _close_ffmpeg_async를 쓴다 (여기의 join/wait가 UI 프레임을 수백 ms 멈춘다)."""
+    th, q, ev, proc = self._detach_ffmpeg_session()
+    if th is None and proc is None:
+      return
+    self._signal_writer_stop(q, ev)
+    self._record_teardown(th, proc)
+
+  def _close_ffmpeg_async(self):
+    """세션 참조를 즉시 끊고 정지 신호만 보낸 뒤, blocking 정리(writer join/
+    stdin close/proc wait)는 강등된 백그라운드 스레드에 맡긴다 — 60초 회전 ~428ms,
+    stop ~538ms UI 프레임 정지(route 41d) 제거. fail-closed 의미는 그대로:
+    teardown은 timeout+terminate+kill 체인으로 bounded이고, 새 세션과는 객체가
+    분리되어 있으며, 밀린 정리가 2개 이상이면 start_recording이 시작을 거부한다."""
+    th, q, ev, proc = self._detach_ffmpeg_session()
+    if th is None and proc is None:
+      return
+    self._signal_writer_stop(q, ev)
+    cleanup = threading.Thread(target=self._record_cleanup_worker, args=(th, proc), daemon=True)
+    self._record_cleanup_threads = [t for t in self._record_cleanup_threads if t.is_alive()]
+    self._record_cleanup_threads.append(cleanup)
+    cleanup.start()
+
+  def _record_cleanup_worker(self, th, proc):
+    # 이 스레드도 UI의 RT 스케줄링을 상속한다 — 대부분 blocking 대기지만 강등해 둔다.
+    # 강등 실패해도 진행: 정리는 인코더를 멈추는 방향이라 미루는 쪽이 더 위험하고,
+    # join/wait 대기는 CPU를 태우지 않는다
+    self._demote_record_sched()
+    self._record_teardown(th, proc)
+    print("[REC] encoder closed")
+
+  @staticmethod
+  def _record_teardown(th, proc) -> None:
+    """blocking 정리 본체 — 정지 신호(_signal_writer_stop)는 이미 보낸 상태여야 한다."""
     try:
-      if th is not None and ev is not None:
-        ev.set()
-      if th is not None and q is not None:
-        try:
-          q.put_nowait(None)
-        except Exception:
-          pass
+      if th is not None:
         th.join(timeout=30)
     except Exception:
       pass
 
-    # proc stop
     if proc is not None:
       try:
         stdin = proc.stdin
@@ -898,6 +1025,14 @@ class GuiApplication:
         except Exception:
           pass
 
+  def _join_record_cleanups(self, timeout: float) -> None:
+    """앱 종료 시 진행 중인 비동기 정리 회수. timeout이 지나도 남으면 그대로 두는데,
+    stdin은 teardown 초반에 닫히므로 인코더는 스스로 파일을 마무리하고 종료한다."""
+    deadline = time.monotonic() + timeout
+    for t in self._record_cleanup_threads:
+      t.join(timeout=max(0.0, deadline - time.monotonic()))
+    self._record_cleanup_threads = [t for t in self._record_cleanup_threads if t.is_alive()]
+
   def close(self):
     if not rl.is_window_ready():
       return
@@ -925,6 +1060,9 @@ class GuiApplication:
 
     self.stop_recording()
     self.close_ffmpeg()
+    # 진행 중인 비동기 인코더 정리(60초 회전 직후 종료 등)를 회수 — timeout이 지나
+    # 남더라도 stdin은 이미 닫혀 있어 인코더가 스스로 mp4를 마무리하고 끝난다
+    self._join_record_cleanups(timeout=10.0)
     rl.close_window()
 
   @property
@@ -1014,22 +1152,20 @@ class GuiApplication:
         if RECORD or self._record_enabled:
           self._record_frame_idx += 1
           if self._record_frame_idx % self._record_every_n == 0:
-            # 동기식 GPU readback: rlReadTexturePixels가 캡처마다 임시 FBO 생성/해제
-            # (rlog의 "FBO: Unloaded framebuffer" 반복) + ~9MB 이미지 할당 + bytes 복사.
-            # 개선 방향 선택을 위해 wall/cpu를 분리 계측한다 (carrot 녹화 경로만)
-            cap_tok = SectionMetrics.begin() if self._record_enabled else None
-            image = rl.load_image_from_texture(self._render_texture.texture)
-            data_size = image.width * image.height * 4
-            data = bytes(rl.ffi.buffer(image.data, data_size))
-            rl.unload_image(image)
-            if cap_tok is not None:
-              # readback+복사+해제까지만 계측 — 큐 비용은 캡처 비용이 아니므로 제외
-              self._capture_metrics.end(cap_tok)
-            try:
-              self._ffmpeg_queue.put_nowait(data)  # Async write via background thread
-            except queue.Full:
-              pass
-            
+            if self._record_enabled:
+              # carrot 녹화: pooled buffer 캡처 (bytes 생성/GC 제거, route 41d ①안)
+              self._capture_record_frame()
+            else:
+              # upstream RECORD(개발용) 경로 — 무수정: bytes 복사 + upstream writer
+              image = rl.load_image_from_texture(self._render_texture.texture)
+              data_size = image.width * image.height * 4
+              data = bytes(rl.ffi.buffer(image.data, data_size))
+              rl.unload_image(image)
+              try:
+                self._ffmpeg_queue.put_nowait(data)  # Async write via background thread
+              except queue.Full:
+                pass
+
           if self._record_enabled:
             if (self._record_failure_event.is_set()
                 or self._ffmpeg_proc is None or self._ffmpeg_proc.poll() is not None):
