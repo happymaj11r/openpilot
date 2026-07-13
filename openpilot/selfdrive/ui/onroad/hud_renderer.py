@@ -3,9 +3,11 @@ from collections import deque
 import pyray as rl
 from dataclasses import dataclass
 from openpilot.common.constants import CV
+from openpilot.selfdrive.ui import carrot_plot_draw as plot_draw
 from openpilot.selfdrive.ui.carrot_params_watch import ParamsRefreshGate
 from openpilot.selfdrive.ui.carrot_plot_sched import plot_sched_gate
 from openpilot.selfdrive.ui.onroad.exp_button import ExpButton
+from openpilot.system.ui.lib.carrot_render_metrics import SectionMetrics
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
@@ -1202,6 +1204,12 @@ class PlotRenderer:
     self._plot_height = 300.0
     self._plot_dx = 2.0
     self._show_plot_mode_prev = -1
+    # batch 드로잉용 재사용 버퍼 — 기존 per-segment draw_line_ex는 프레임당 최대
+    # 1,197콜 + Vector2 ~1,200개 할당으로 UI CPU를 크게 소비했다 (route 41a)
+    self._pts = [rl.Vector2(0, 0) for _ in range(self.PLOT_MAX)]
+    # wall/cpu 분리 계측 — 선점 대기와 실제 렌더 비용 구분 (window 100 ≈ 저FPS에서도
+    # 짧은 진단 단계 안에 clean 윈도 확보)
+    self._plot_metrics = SectionMetrics("debugPlot", window=100)
 
   def _clear(self):
     self._plot_size = 0
@@ -1356,30 +1364,33 @@ class PlotRenderer:
       self._plot_max = 2.0
 
   def _draw_plotting(self, index: int, x_base: float, y_base: float, color, font):
-    if self._plot_size <= 0:
+    n = self._plot_size
+    if n <= 0:
       return
+
+    plot_draw.log_backend_once(self.PLOT_MAX, 3, 3)
 
     plot_range = self._plot_max - self._plot_min
     plot_ratio = self._plot_height if plot_range < 1.0 else (self._plot_height / plot_range)
 
-    prev = None
-    latest_x = None
-    latest_y = None
-    latest_value = 0.0
+    # 재사용 버퍼에 newest -> oldest 순서로 채운다 (기존 좌표식/순서 보존, 할당 0)
+    q = self._plot_queue[index]
+    pts = self._pts
+    base = y_base + self._plot_height
+    mn = self._plot_min
+    idx = self._plot_index
+    dx = self._plot_dx
+    for i in range(n):
+      p = pts[i]
+      p.x = x_base + (n - i) * dx
+      p.y = base - (q[(idx - i + self.PLOT_MAX) % self.PLOT_MAX] - mn) * plot_ratio
 
-    for i in range(self._plot_size):
-      data = self._plot_queue[index][(self._plot_index - i + self.PLOT_MAX) % self.PLOT_MAX]
-      plot_y = y_base + self._plot_height - (data - self._plot_min) * plot_ratio
-      plot_x = x_base + (self._plot_size - i) * self._plot_dx
+    latest_x = pts[0].x
+    latest_y = pts[0].y
+    latest_value = q[idx % self.PLOT_MAX]
 
-      pt = rl.Vector2(plot_x, plot_y)
-      if prev is not None:
-        rl.draw_line_ex(prev, pt, 3.0, color)
-      else:
-        latest_x = plot_x
-        latest_y = plot_y
-        latest_value = data
-      prev = pt
+    # 시리즈당 draw 콜 1회(spline) — 기존 per-segment 399콜 대비 (route 41a)
+    plot_draw.draw_polyline(pts, n, color, stroke=3)
 
     if latest_x is not None and latest_y is not None:
       draw_text_ui_style(
@@ -1390,6 +1401,9 @@ class PlotRenderer:
   def draw(self, rect: rl.Rectangle, font) -> None:
     # 스케줄러 강등이 검증된 경우에만 0이 아닌 값 (fail-closed, route 416)
     show_plot_mode = plot_sched_gate.effective_mode
+    # phase 전환은 early return보다 먼저 — plot OFF 시 마지막 부분 윈도가
+    # 다음 활성화까지 남거나 유실되지 않고 즉시 배출된다. 세션 ID로 60초 회전도 분리
+    self._plot_metrics.set_phase((show_plot_mode, *gui_app.recording_phase()))
     if show_plot_mode == 0:
       return
     try:
@@ -1402,6 +1416,8 @@ class PlotRenderer:
       self._clear()
       self._show_plot_mode_prev = show_plot_mode
 
+    _tok = self._plot_metrics.begin()
+
     try:
       plot_data, title = self._make_plot_data(ui_state.sm, show_plot_mode)
     except Exception:
@@ -1410,6 +1426,7 @@ class PlotRenderer:
     self._update_plot_queue(plot_data)
 
     if rect.width < 1200:
+      self._plot_metrics.end(_tok)
       return
 
     x_base = rect.x + self._plot_x
@@ -1423,3 +1440,4 @@ class PlotRenderer:
       title, x_base + 400, y_base - 20, 25, rl.WHITE,
       font=font, border_width=2.0, shadow_offset=4.0, align='center_bottom',
     )
+    self._plot_metrics.end(_tok)

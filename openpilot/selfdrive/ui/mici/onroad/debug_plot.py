@@ -4,22 +4,15 @@ from typing import List, Tuple
 
 import pyray as rl
 
-from openpilot.common.swaglog import cloudlog
 from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.carrot_render_metrics import SectionMetrics
+from openpilot.selfdrive.ui import carrot_plot_draw as plot_draw
 from openpilot.selfdrive.ui.carrot_plot_sched import plot_sched_gate
 from openpilot.selfdrive.ui.ui_state import ui_state
 
 
 PLOT_MAX = 300
-
-# batch line API 가용성은 로드 시 1회만 판정 — draw_spline_linear는 두께 있는
-# 폴리라인을 한 번에 그린다 (driver_state.py에서 사용 중인 검증된 바인딩)
-_HAS_SPLINE = hasattr(rl, "draw_spline_linear")
-_HAS_LINE_STRIP = hasattr(rl, "draw_line_strip")
-_batch_warned = False
-_backend_logged = False
 
 
 def _safe_get(obj, path: str, default=0.0):
@@ -251,17 +244,7 @@ class DebugPlot(Widget):
       self._xs_key = key
 
   def _draw_series(self, rect: rl.Rectangle, series_idx: int, color: rl.Color, stroke: int = 3):
-    # 실제 선택된 backend를 프로세스 수명당 1회만 기록 (성능 분석용, 매 프레임 금지).
-    # 진단 로그가 첫 plot 프레임을 죽이면 안 되므로 no-throw
-    global _backend_logged
-    if not _backend_logged:
-      _backend_logged = True
-      try:
-        backend = "spline" if _HAS_SPLINE else ("line_strip" if _HAS_LINE_STRIP else "legacy")
-        ver = getattr(rl, "RAYLIB_VERSION", "?")
-        cloudlog.warning(f"PLOTDRAW: backend={backend} points={PLOT_MAX} series=3 stroke={stroke} raylib={ver}")
-      except Exception:
-        pass
+    plot_draw.log_backend_once(PLOT_MAX, 3, stroke)
 
     n = self.plot_size
     if n < 2:
@@ -287,34 +270,7 @@ class DebugPlot(Widget):
 
     # 시리즈당 draw 콜을 1~stroke회로 제한 — 기존 per-segment 방식은 프레임당
     # 약 2,691회의 Python->raylib 콜로 UI를 상시 실행 상태로 만들었다 (route 416)
-    global _batch_warned
-    if _HAS_SPLINE:
-      rl.draw_spline_linear(pts, n, float(max(1, stroke)), color)
-    elif _HAS_LINE_STRIP:
-      offsets = range(-(stroke // 2), stroke // 2 + 1) if stroke > 1 else range(1)
-      applied = 0
-      for o in offsets:
-        d = o - applied
-        if d:
-          for i in range(n):
-            pts[i].y += d
-          applied = o
-        rl.draw_line_strip(pts, n, color)
-    else:
-      if not _batch_warned:
-        _batch_warned = True
-        try:
-          cloudlog.warning("PLOTDRAW: no batch line API in pyray, falling back to per-segment draw_line")
-        except Exception:
-          pass
-      for i in range(1, n):
-        x0, y0 = pts[i - 1].x, pts[i - 1].y
-        x1, y1 = pts[i].x, pts[i].y
-        if stroke <= 1:
-          rl.draw_line(int(x0), int(y0), int(x1), int(y1), color)
-        else:
-          for o in range(-(stroke // 2), stroke // 2 + 1):
-            rl.draw_line(int(x0), int(y0) + o, int(x1), int(y1) + o, color)
+    plot_draw.draw_polyline(pts, n, color, stroke)
 
     last_val = self._get_series_value(series_idx, 0)
     label = f"{last_val:.2f}"

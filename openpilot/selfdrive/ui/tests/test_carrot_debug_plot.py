@@ -8,6 +8,7 @@ import types
 
 import pytest
 
+import openpilot.selfdrive.ui.carrot_plot_draw as cpd
 import openpilot.selfdrive.ui.mici.onroad.debug_plot as dp
 from openpilot.selfdrive.ui.mici.onroad.debug_plot import PLOT_MAX, DebugPlot
 
@@ -44,11 +45,12 @@ class FakeRl:
 
 def make_plot(monkeypatch, *, has_spline, has_strip, plot_index=137, plot_size=PLOT_MAX):
   fake = FakeRl()
-  monkeypatch.setattr(dp, "rl", fake)
-  monkeypatch.setattr(dp, "_HAS_SPLINE", has_spline)
-  monkeypatch.setattr(dp, "_HAS_LINE_STRIP", has_strip)
-  monkeypatch.setattr(dp, "_batch_warned", False)
-  monkeypatch.setattr(dp, "_backend_logged", True)  # backend 로그는 전용 테스트에서만
+  monkeypatch.setattr(dp, "rl", fake)   # 라벨(draw_text/measure_text)용
+  monkeypatch.setattr(cpd, "rl", fake)  # 폴리라인 batch(공용 헬퍼)용
+  monkeypatch.setattr(cpd, "HAS_SPLINE", has_spline)
+  monkeypatch.setattr(cpd, "HAS_LINE_STRIP", has_strip)
+  monkeypatch.setattr(cpd, "_fallback_warned", False)
+  monkeypatch.setattr(cpd, "_backend_logged", True)  # backend 로그는 전용 테스트에서만
 
   p = object.__new__(DebugPlot)
   p.plot_size = plot_size
@@ -110,8 +112,8 @@ class TestBatchDrawing:
 
   def test_legacy_fallback_same_call_count_and_warns_once(self, monkeypatch):
     warnings = []
-    monkeypatch.setattr(dp, "cloudlog", types.SimpleNamespace(warning=warnings.append))
     p, fake = make_plot(monkeypatch, has_spline=False, has_strip=False)
+    monkeypatch.setattr(cpd, "cloudlog", types.SimpleNamespace(warning=warnings.append))
     p._draw_series(RECT, 0, COLOR, stroke=3)
     p._draw_series(RECT, 1, COLOR, stroke=3)
     # 기존 구현과 동일: (PLOT_MAX-1) segment * stroke 3
@@ -145,8 +147,8 @@ class TestBackendLog:
   def _run(self, monkeypatch, has_spline, has_strip):
     p, _ = make_plot(monkeypatch, has_spline=has_spline, has_strip=has_strip)
     warnings = []
-    monkeypatch.setattr(dp, "cloudlog", types.SimpleNamespace(warning=warnings.append))
-    monkeypatch.setattr(dp, "_backend_logged", False)
+    monkeypatch.setattr(cpd, "cloudlog", types.SimpleNamespace(warning=warnings.append))
+    monkeypatch.setattr(cpd, "_backend_logged", False)
     p._draw_series(RECT, 0, COLOR, stroke=3)
     p._draw_series(RECT, 1, COLOR, stroke=3)  # 두 번째 호출은 로그 없어야 함
     return [w for w in warnings if "PLOTDRAW: backend=" in w]
@@ -170,8 +172,8 @@ class TestBackendLog:
     # legacy에서는 backend 로그와 per-segment 폴백 경고가 각각 정확히 1회
     p, _ = make_plot(monkeypatch, has_spline=False, has_strip=False)
     warnings = []
-    monkeypatch.setattr(dp, "cloudlog", types.SimpleNamespace(warning=warnings.append))
-    monkeypatch.setattr(dp, "_backend_logged", False)
+    monkeypatch.setattr(cpd, "cloudlog", types.SimpleNamespace(warning=warnings.append))
+    monkeypatch.setattr(cpd, "_backend_logged", False)
     p._draw_series(RECT, 0, COLOR, stroke=3)
     p._draw_series(RECT, 1, COLOR, stroke=3)
     assert len([w for w in warnings if "backend=legacy" in w]) == 1
@@ -182,18 +184,18 @@ class TestBackendLog:
     p, fake = make_plot(monkeypatch, has_spline=True, has_strip=True)
     def boom(_):
       raise RuntimeError("log backend down")
-    monkeypatch.setattr(dp, "cloudlog", types.SimpleNamespace(warning=boom))
-    monkeypatch.setattr(dp, "_backend_logged", False)
+    monkeypatch.setattr(cpd, "cloudlog", types.SimpleNamespace(warning=boom))
+    monkeypatch.setattr(cpd, "_backend_logged", False)
     p._draw_series(RECT, 0, COLOR, stroke=3)  # 예외가 전파되면 테스트 실패
-    assert dp._backend_logged is True
+    assert cpd._backend_logged is True
     assert len(fake.spline_calls) == 1  # 로그 실패와 무관하게 그리기는 수행
 
   def test_fallback_warning_failure_swallowed(self, monkeypatch):
     p, fake = make_plot(monkeypatch, has_spline=False, has_strip=False)
     def boom(_):
       raise RuntimeError("log backend down")
-    monkeypatch.setattr(dp, "cloudlog", types.SimpleNamespace(warning=boom))
-    p._draw_series(RECT, 0, COLOR, stroke=3)  # _batch_warned 경고 실패도 무전파
+    monkeypatch.setattr(cpd, "cloudlog", types.SimpleNamespace(warning=boom))
+    p._draw_series(RECT, 0, COLOR, stroke=3)  # 폴백 경고 실패도 무전파
     assert len(fake.line_calls) == (PLOT_MAX - 1) * 3
 
 

@@ -5,6 +5,7 @@ from openpilot.cereal import log, messaging
 from msgq.visionipc import VisionStreamType
 from openpilot.selfdrive.ui import UI_BORDER_SIZE
 from openpilot.selfdrive.ui.carrot_params_watch import ParamsRefreshGate
+from openpilot.selfdrive.ui.carrot_plot_sched import plot_sched_gate
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.selfdrive.ui.onroad.alert_renderer import AlertRenderer
 from openpilot.selfdrive.ui.onroad.driver_state import DriverStateRenderer
@@ -12,6 +13,7 @@ from openpilot.selfdrive.ui.onroad.hud_renderer import HudRenderer
 from openpilot.selfdrive.ui.onroad.model_renderer import ModelRenderer
 from openpilot.selfdrive.ui.onroad.cameraview import CameraView
 from openpilot.system.ui.lib.application import gui_app
+from openpilot.system.ui.lib.carrot_render_metrics import SectionMetrics
 from openpilot.system.ui.lib.text_draw import draw_text_ui_style
 from openpilot.common.transformations.camera import DEVICE_CAMERAS, DeviceCameraConfig, view_frame_from_device_frame
 from openpilot.common.transformations.orientation import rot_from_euler
@@ -53,6 +55,9 @@ class AugmentedRoadView(CameraView):
 
     # debug
     self._pm = messaging.PubMaster(['uiDebug'])
+    # wall/cpu 분리 계측 — drawTimeMillis(wall)만으로는 SCHED_OTHER 선점 대기와
+    # 실제 렌더 비용을 구분할 수 없다 (route 41a 진단)
+    self._render_metrics = SectionMetrics("uiRender", window=100)
 
     # 테두리 텍스트용 Params 캐시 (설정 변경 시에만 재읽기)
     self._border_params_gate = ParamsRefreshGate()
@@ -62,10 +67,14 @@ class AugmentedRoadView(CameraView):
     self._border_custom_sr = 0.0
 
   def _render(self, rect):
+    # phase 전환(과 그때의 부분 윈도 emit 비용)은 drawTimeMillis 측정 밖에서 처리 —
+    # 단계 전환 프레임에 인위적 spike가 기록되지 않는다. 세션 ID로 60초 회전도 분리
+    self._render_metrics.set_phase((plot_sched_gate.effective_mode, *gui_app.recording_phase()))
     # Only render when system is started to avoid invalid data access
     start_draw = time.monotonic()
     if not ui_state.started:
       return
+    _tok = self._render_metrics.begin()
 
     self._switch_stream_if_needed(ui_state.sm)
 
@@ -109,9 +118,11 @@ class AugmentedRoadView(CameraView):
 
     total = time.monotonic() - start_draw
 
-    # publish uiDebug
+    # publish uiDebug — 기존 drawTimeMillis 값을 먼저 확정한 뒤 계측을 기록해서
+    # PLOTPERF emit(sort/문자열/cloudlog) 비용이 기존 지표의 spike로 오염되지 않게 한다
     msg = messaging.new_message('uiDebug')
     msg.uiDebug.drawTimeMillis = total * 1000
+    self._render_metrics.end(_tok)
     self._pm.send('uiDebug', msg)
 
   def _handle_mouse_press(self, _):
