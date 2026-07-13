@@ -24,6 +24,9 @@ def make_app(**over):
   app._record_enabled = False
   app._record_fail_count = 0
   app._record_fail_t = 0.0
+  app._record_session_id = 0
+  app._record_t0 = 0.0
+  app._record_drop_counts = dict.fromkeys(("pool_empty", "queue_full", "size_mismatch", "capture_error"), 0)
   app._ffmpeg_thread = None
   app._ffmpeg_queue = None
   app._ffmpeg_stop_event = None
@@ -34,13 +37,18 @@ def make_app(**over):
 
 
 class FakeProc:
-  def __init__(self, wait_script=()):
+  def __init__(self, wait_script=(), alive=False, dies_on_kill=True):
     # wait_script: proc.wait 호출마다 소비 — "ok" | "timeout" | Exception 인스턴스
     self.wait_calls = []
     self.kill_calls = 0
     self.terminate_calls = 0
     self._script = list(wait_script)
+    self._alive = alive
+    self._dies_on_kill = dies_on_kill
     self.stdin = None
+
+  def poll(self):
+    return None if self._alive else 0
 
   def wait(self, timeout=None):
     self.wait_calls.append(timeout)
@@ -56,6 +64,8 @@ class FakeProc:
 
   def kill(self):
     self.kill_calls += 1
+    if self._dies_on_kill:
+      self._alive = False
 
 
 class TestRecordBufPool:
@@ -256,14 +266,130 @@ class TestAsyncClose:
     assert done.wait(timeout=5)
 
 
+class TestWriterLifecycle:
+  """재재리뷰 확정 경로: pre-loop 회수, 세션 고정, start 실패 rollback."""
+
+  def test_preloop_failure_recovers_queued_buffers(self):
+    # 강등 실패로 loop 진입 전 종료해도, 검증하는 동안 캡처가 큐에 넣은 버퍼를
+    # 래퍼 finally가 회수한다 — 안 거두면 실패 한 번에 풀이 전량 소실
+    app = make_app()
+    app._demote_record_sched = lambda: False
+    pool = _RecordBufPool(4, 2)
+    wq = queue.Queue()
+    wq.put(pool.take())
+    wq.put(pool.take())
+    fev = threading.Event()
+    proc = FakeProc(alive=True)
+    app._record_writer_thread(proc, wq, threading.Event(), fev, pool)
+    assert pool._q.qsize() == 2 and wq.empty()
+    assert fev.is_set() and proc.kill_calls == 1  # fail-closed 의미 유지
+
+  def test_writer_uses_only_bound_session(self, monkeypatch):
+    # Thread.start() 직후 stop/회전이 self._ffmpeg_*를 끊고 새 세션으로 바꿔도,
+    # 늦게 실행된 writer는 args로 고정된 자기 세션만 본다
+    monkeypatch.setattr(app_mod, "sys", types.SimpleNamespace(platform="test"))  # ffmpeg 검증 스킵
+    app = make_app()
+    app._demote_record_sched = lambda: True
+    new_pool = _RecordBufPool(8, 1)  # 새 세션 (다른 크기 세대)
+    app._record_buf_pool = new_pool
+    app._ffmpeg_queue = queue.Queue()  # 새 세션 큐 — writer가 건드리면 안 된다
+    old_pool = _RecordBufPool(4, 1)
+    old_q = queue.Queue()
+    writes = []
+    old_proc = types.SimpleNamespace(
+      stdin=types.SimpleNamespace(write=lambda d: writes.append(bytes(d))), poll=lambda: None)
+    old_q.put(old_pool.take())
+    old_q.put(None)
+    old_fev = threading.Event()
+    app._record_writer_thread(old_proc, old_q, threading.Event(), old_fev, old_pool)
+    assert len(writes) == 1 and old_pool._q.qsize() == 1  # 자기 세션 풀로만 반환
+    assert new_pool._q.qsize() == 1 and app._ffmpeg_queue.empty()  # 새 세션 불가침
+
+  def test_writer_thread_start_failure_rolls_back(self, monkeypatch):
+    from pathlib import Path
+    app = make_app()
+    app._width, app._height, app._target_fps = 4, 4, 20
+    app._record_failure_event = threading.Event()
+    fp = FakeProc(alive=True)
+    monkeypatch.setattr(app_mod.subprocess, "Popen", lambda *a, **k: fp)
+    class DeadThread:
+      def __init__(self, *a, **k):
+        pass
+      def start(self):
+        raise RuntimeError("no threads")
+    monkeypatch.setattr(app_mod.threading, "Thread", DeadThread)
+    ok = app._init_ffmpeg(Path("/tmp/x.mp4"))  # 예외 무전파 + False (정상 실패 경로 합류)
+    assert ok is False
+    assert fp.kill_calls == 1 and fp.wait_calls  # 인코더 rollback: kill + reap
+    assert (app._ffmpeg_proc is None and app._ffmpeg_queue is None
+            and app._ffmpeg_thread is None and app._ffmpeg_stop_event is None)
+
+
+class TestTeardownWriterAlive:
+  def test_skips_stdin_and_kills_when_writer_stuck(self):
+    # writer가 join(30s) 후에도 살아 있으면(stdin.write 블록) stdin flush/close를
+    # 동시에 하지 않는다 — 곧장 kill로 파이프를 끊는다 (bounded)
+    stuck_writer = types.SimpleNamespace(join=lambda timeout=None: None, is_alive=lambda: True)
+    touched = []
+    proc = FakeProc(alive=True)
+    proc.stdin = types.SimpleNamespace(
+      closed=False, flush=lambda: touched.append("flush"), close=lambda: touched.append("close"))
+    GuiApplication._record_teardown(stuck_writer, proc)
+    assert touched == []  # 경합 금지
+    assert proc.kill_calls == 1 and len(proc.wait_calls) == 1  # kill + reap
+
+
+class TestPruneCleanups:
+  def test_dead_thread_live_proc_kept_and_rekilled(self):
+    # 스레드가 끝나도 인코더가 살아 있으면 백로그로 유지 + 지날 때마다 kill 재시도
+    app = make_app()
+    dead = types.SimpleNamespace(is_alive=lambda: False)
+    stubborn = FakeProc(alive=True, dies_on_kill=False)
+    app._record_cleanups = [(dead, stubborn)]
+    app._prune_record_cleanups()
+    assert len(app._record_cleanups) == 1 and stubborn.kill_calls == 1
+
+  def test_dead_thread_proc_dies_on_kill_resolved(self):
+    app = make_app()
+    dead = types.SimpleNamespace(is_alive=lambda: False)
+    proc = FakeProc(alive=True, dies_on_kill=True)
+    app._record_cleanups = [(dead, proc)]
+    app._prune_record_cleanups()
+    assert app._record_cleanups == [] and proc.kill_calls == 1  # kill로 해소
+
+  def test_dead_thread_dead_proc_removed(self):
+    app = make_app()
+    dead = types.SimpleNamespace(is_alive=lambda: False)
+    app._record_cleanups = [(dead, FakeProc(alive=False))]
+    app._prune_record_cleanups()
+    assert app._record_cleanups == []
+
+  def test_alive_thread_kept_without_kill(self):
+    app = make_app()
+    alive = types.SimpleNamespace(is_alive=lambda: True)
+    proc = FakeProc(alive=True)
+    app._record_cleanups = [(alive, proc)]
+    app._prune_record_cleanups()
+    assert len(app._record_cleanups) == 1 and proc.kill_calls == 0  # 진행 중 정리는 존중
+
+
 class TestJoinCleanups:
   def test_leftover_encoders_killed_and_reaped(self):
     app = make_app()
-    proc = FakeProc()
+    proc = FakeProc(alive=True)
     stuck = types.SimpleNamespace(join=lambda timeout=None: None, is_alive=lambda: True)
     app._record_cleanups = [(stuck, proc)]
     app._join_record_cleanups(timeout=0.1)
     assert proc.kill_calls == 1 and len(proc.wait_calls) == 1  # 살아있는 ffmpeg 금지
+
+  def test_dead_thread_live_proc_also_killed_on_exit(self):
+    # 스레드는 끝났지만 인코더가 잔존한 항목도 앱 종료 시 kill/reap 대상
+    app = make_app()
+    proc = FakeProc(alive=True)
+    dead = types.SimpleNamespace(join=lambda timeout=None: None, is_alive=lambda: False)
+    app._record_cleanups = [(dead, proc)]
+    app._join_record_cleanups(timeout=0.1)
+    assert proc.kill_calls == 1 and app._record_cleanups == []
 
 
 class TestDeferredStartContract:
@@ -292,6 +418,80 @@ class TestDeferredStartContract:
     app._record_start_pending = True
     app.stop_recording()
     assert not app.is_record_start_pending()
+
+  def test_backlog_resolution_resumes_start(self):
+    # 백로그가 해소되면(스레드 종료+인코더 사망) pending이 풀리고 시작 로직이 진행된다
+    app = make_app()
+    dead = types.SimpleNamespace(is_alive=lambda: False)
+    app._record_cleanups = [(dead, FakeProc(alive=False)), (dead, FakeProc(alive=False))]
+    app._record_start_pending = True
+    ensured = []
+    app._ensure_render_texture_for_recording = lambda: ensured.append(1)
+    app._render_texture = None  # 시작 로직 진입 확인 후 여기서 중단
+    app.start_recording()
+    assert not app.is_record_start_pending() and ensured == [1]
+
+
+class TestDropCounters:
+  def _wire(self, monkeypatch, app, *, w=2, h=2, readback_raises=False):
+    def load(_tex):
+      if readback_raises:
+        raise RuntimeError("GL context lost")
+      return types.SimpleNamespace(width=w, height=h, data=bytes(w * h * 4))
+    monkeypatch.setattr(app_mod, "rl", types.SimpleNamespace(
+      load_image_from_texture=load, unload_image=lambda img: None,
+      ffi=types.SimpleNamespace(memmove=lambda dest, src, n: dest.__setitem__(slice(0, n), src[:n])),
+    ))
+    app._render_texture = types.SimpleNamespace(texture=object())
+    app._capture_metrics = types.SimpleNamespace(end=lambda tok: None, flush=lambda: None)
+    app._ffmpeg_queue = queue.Queue(maxsize=8)
+
+  def test_each_drop_path_counted(self, monkeypatch):
+    app = make_app()
+    app._ensure_record_buf_pool(16)
+    self._wire(monkeypatch, app)
+    app._record_buf_pool = _RecordBufPool(16, 1)
+    app._record_buf_pool.take()  # 고갈
+    app._capture_record_frame()
+    assert app._record_drop_counts["pool_empty"] == 1
+
+    app._ensure_record_buf_pool(16)  # 같은 크기 — 재사용이므로 새로 생성
+    app._record_buf_pool = _RecordBufPool(16, 3)
+    app._ffmpeg_queue = queue.Queue(maxsize=1)
+    app._ffmpeg_queue.put_nowait(b"x")  # 큐 가득
+    app._capture_record_frame()
+    assert app._record_drop_counts["queue_full"] == 1
+
+    app._ffmpeg_queue = queue.Queue(maxsize=8)
+    app._record_buf_pool = _RecordBufPool(64, 1)  # 텍스처(16B)와 불일치
+    app._capture_record_frame()
+    assert app._record_drop_counts["size_mismatch"] == 1
+
+    app._record_buf_pool = _RecordBufPool(16, 1)
+    self._wire(monkeypatch, app, readback_raises=True)
+    app._ffmpeg_queue = queue.Queue(maxsize=8)
+    app._capture_record_frame()
+    assert app._record_drop_counts["capture_error"] == 1
+
+  def test_stop_emits_summary_even_when_zero(self, capsys):
+    # '로그 없음'과 '드랍 0'을 구분할 수 있어야 한다 — 0이어도 한 줄 배출
+    app = make_app()
+    app._record_enabled = True
+    app._capture_metrics = types.SimpleNamespace(flush=lambda: None)
+    app._close_ffmpeg_async = lambda: None
+    app.stop_recording()
+    out = capsys.readouterr().out
+    assert "session drops: pool_empty=0 queue_full=0 size_mismatch=0 capture_error=0" in out
+
+  def test_start_resets_counters_per_session(self):
+    app = make_app()
+    app._record_drop_counts["pool_empty"] = 7
+    app._render_texture = types.SimpleNamespace(texture=types.SimpleNamespace(width=2, height=2))
+    app._ensure_render_texture_for_recording = lambda: None
+    app._new_record_path = lambda: "/tmp/x.mp4"
+    app._init_ffmpeg = lambda path: True
+    app.start_recording()
+    assert app._record_enabled and all(v == 0 for v in app._record_drop_counts.values())
 
 
 class TestMainLayoutSync:
