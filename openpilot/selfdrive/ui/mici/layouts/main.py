@@ -167,6 +167,7 @@ class MiciMainLayout(Scroller):
       # 스케줄러 강등이 검증된 경우에만 0이 아닌 값 (fail-closed, route 416)
       show_plot_mode = plot_sched_gate.effective_mode
       cluster_hud_connected = ui_state.params.get_bool("ClusterHudConnected")
+      self._onroad_layout.set_cluster_hud_connected(cluster_hud_connected)
       effective_plot_mode = 0 if cluster_hud_connected else show_plot_mode
       if effective_plot_mode != self._show_plot_mode:
         self._show_plot_mode = effective_plot_mode
