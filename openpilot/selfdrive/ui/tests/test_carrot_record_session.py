@@ -26,7 +26,8 @@ def make_app(**over):
   app._record_fail_t = 0.0
   app._record_session_id = 0
   app._record_t0 = 0.0
-  app._record_drop_counts = dict.fromkeys(("pool_empty", "queue_full", "size_mismatch", "capture_error", "stop_gate"), 0)
+  app._record_drop_counts = dict.fromkeys(
+    ("pool_empty", "queue_full", "size_mismatch", "capture_error", "stop_gate", "gate_busy"), 0)
   app._ffmpeg_thread = None
   app._ffmpeg_enqueue_lock = None
   app._ffmpeg_queue = None
@@ -489,7 +490,7 @@ class TestDropCounters:
     app._close_ffmpeg_async = lambda: None
     app.stop_recording()
     out = capsys.readouterr().out
-    assert "session drops: pool_empty=0 queue_full=0 size_mismatch=0 capture_error=0 stop_gate=0" in out
+    assert "session drops: pool_empty=0 queue_full=0 size_mismatch=0 capture_error=0 stop_gate=0 gate_busy=0" in out
 
   def test_start_resets_counters_per_session(self):
     app = make_app()
@@ -678,3 +679,136 @@ class TestFailCountPolicy:
     app.start_recording()
     assert app._record_fail_count == 1 and app._record_fail_t > 0
     assert not app._record_enabled
+
+
+class TestOrphanTracking:
+  """kill에 불응한 인코더가 어떤 동기 경로에서도 추적 밖으로 빠지면 안 된다."""
+
+  def test_writer_start_rollback_tracks_stubborn_proc(self, monkeypatch, capsys):
+    from pathlib import Path
+    app = make_app()
+    app._width, app._height, app._target_fps = 4, 4, 20
+    app._record_failure_event = threading.Event()
+    stubborn = FakeProc(alive=True, dies_on_kill=False)  # kill 불응
+    monkeypatch.setattr(app_mod.subprocess, "Popen", lambda *a, **k: stubborn)
+    class DeadThread:
+      def __init__(self, *a, **k):
+        pass
+      def start(self):
+        raise RuntimeError("no threads")
+    monkeypatch.setattr(app_mod.threading, "Thread", DeadThread)
+    assert app._init_ffmpeg(Path("/tmp/x.mp4")) is False
+    # orphan 금지: 백로그에 등록되어 prune 재kill/앱 종료 회수 대상이 된다
+    assert len(app._record_cleanups) == 1 and app._record_cleanups[0][1] is stubborn
+    assert "cleanup incomplete" in capsys.readouterr().out
+
+  def test_sync_close_tracks_unresolved_teardown(self, capsys):
+    app = make_app()
+    app._record_teardown = lambda th, proc: False  # 미해소
+    stubborn = FakeProc(alive=True, dies_on_kill=False)
+    app._ffmpeg_thread, app._ffmpeg_queue = object(), queue.Queue()
+    app._ffmpeg_stop_event, app._ffmpeg_proc = threading.Event(), stubborn
+    assert app.close_ffmpeg() is False
+    assert len(app._record_cleanups) == 1 and app._record_cleanups[0][1] is stubborn
+    out = capsys.readouterr().out
+    assert "cleanup incomplete" in out and "encoder closed" not in out
+    # 이후 앱 종료 join이 이 proc을 회수 시도하고 잔존을 보고한다
+    app._join_record_cleanups(timeout=0.1)
+    assert "STILL ALIVE" in capsys.readouterr().out
+
+  def test_sync_close_success_logs_closed_once(self, capsys):
+    app = make_app()
+    app._record_teardown = lambda th, proc: True
+    app._ffmpeg_thread, app._ffmpeg_queue = object(), queue.Queue()
+    app._ffmpeg_stop_event, app._ffmpeg_proc = threading.Event(), FakeProc(alive=False)
+    assert app.close_ffmpeg() is True
+    assert capsys.readouterr().out.count("encoder closed") == 1
+    assert app._record_cleanups == []
+
+  def test_no_duplicate_tracking_for_same_proc(self):
+    app = make_app()
+    stubborn = FakeProc(alive=True, dies_on_kill=False)
+    assert app._track_unresolved_record_proc(stubborn) is False
+    assert app._track_unresolved_record_proc(stubborn) is False
+    assert len(app._record_cleanups) == 1  # 같은 proc 이중 등록 금지
+
+  def test_init_refuses_when_previous_close_unresolved(self):
+    # 시작 전 safety close가 미해소면 새 인코더를 띄우지 않는다 (정책 명시)
+    app = make_app()
+    app._record_teardown = lambda th, proc: False
+    app._ffmpeg_thread, app._ffmpeg_queue = object(), queue.Queue()
+    app._ffmpeg_stop_event, app._ffmpeg_proc = threading.Event(), FakeProc(alive=True, dies_on_kill=False)
+    app._width, app._height, app._target_fps = 4, 4, 20
+    assert app._init_ffmpeg("/tmp/x.mp4") is False  # Popen 이전에 중단
+
+
+class TestGateNonBlocking:
+  def test_lock_busy_drops_without_waiting(self, monkeypatch):
+    # writer가 락을 쥔 채 선점당해도 UI는 기다리지 않는다 — try-lock 실패 = 드랍
+    app = make_app()
+    app._ensure_record_buf_pool(16)
+    monkeypatch.setattr(app_mod, "rl", types.SimpleNamespace(
+      load_image_from_texture=lambda tex: types.SimpleNamespace(width=2, height=2, data=bytes(16)),
+      unload_image=lambda img: None,
+      ffi=types.SimpleNamespace(memmove=lambda dest, src, n: dest.__setitem__(slice(0, n), src[:n])),
+    ))
+    app._render_texture = types.SimpleNamespace(texture=object())
+    app._capture_metrics = types.SimpleNamespace(end=lambda tok: None, flush=lambda: None)
+    app._ffmpeg_queue = queue.Queue(maxsize=8)
+    app._ffmpeg_enqueue_lock = threading.Lock()
+    app._ffmpeg_stop_event = threading.Event()
+    app._record_failure_event = threading.Event()
+    app._ffmpeg_enqueue_lock.acquire()  # writer가 drain 중인 상황 재현
+    try:
+      app._capture_record_frame()  # 즉시 반환해야 한다 (블록 금지)
+    finally:
+      app._ffmpeg_enqueue_lock.release()
+    assert app._record_drop_counts["gate_busy"] == 1
+    assert app._ffmpeg_queue.empty()
+    assert app._record_buf_pool._q.qsize() == app._record_buf_count  # buf 회수
+
+
+class TestBoundedStdinClose:
+  class BlockingStdin:
+    """파이프 가득 + 인코더 미소비 상황 — flush가 무한 블록."""
+    closed = False
+
+    def __init__(self):
+      self.unblock = threading.Event()
+
+    def flush(self):
+      self.unblock.wait(timeout=30)  # kill이 파이프를 깨면 풀린다 (테스트에선 Event)
+
+    def close(self):
+      pass
+
+  def test_blocked_flush_falls_through_to_kill(self):
+    stdin = self.BlockingStdin()
+    proc = FakeProc(alive=True)
+    proc.stdin = stdin
+    def kill_and_unblock():
+      proc.kill_calls += 1
+      stdin.unblock.set()  # 실제로는 kill이 파이프를 깨서 flush가 풀림
+    proc.kill = kill_and_unblock
+    GuiApplication._close_encoder_stdin_bounded(proc, timeout=0.2)
+    assert proc.kill_calls == 1  # timeout 안에 kill 진입 (무한 대기 금지)
+
+  def test_normal_close_no_kill(self):
+    closed = []
+    proc = FakeProc(alive=True)
+    proc.stdin = types.SimpleNamespace(closed=False, flush=lambda: None, close=lambda: closed.append(1))
+    GuiApplication._close_encoder_stdin_bounded(proc, timeout=2.0)
+    assert closed == [1] and proc.kill_calls == 0
+
+
+class TestCloseWindowIndependence:
+  def test_recorder_cleanup_runs_when_window_not_ready(self, monkeypatch):
+    # recorder lifecycle은 raylib window와 독립 — window가 없어도 인코더는 회수한다
+    app = make_app()
+    calls = []
+    app.close_ffmpeg = lambda: calls.append("close_ffmpeg") or True
+    app.stop_recording = lambda: calls.append("stop_recording")
+    app._join_record_cleanups = lambda timeout: calls.append("join")
+    monkeypatch.setattr(app_mod, "rl", types.SimpleNamespace(is_window_ready=lambda: False))
+    app.close()  # window 미준비 — 녹화 정리는 수행, 텍스처 정리는 스킵
+    assert calls == ["close_ffmpeg", "stop_recording", "close_ffmpeg", "join"]
