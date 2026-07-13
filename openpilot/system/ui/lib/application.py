@@ -266,6 +266,20 @@ class _DeadThreadMarker:
     return
 
 
+def _record_stdin_write_all(stdin, data) -> None:
+  """unbuffered(raw) 인코더 stdin에 전량 쓴다 — raw write는 partial일 수 있어
+  반복한다. 진행 불가(None/0)나 예외는 그대로 올려 writer가 비정상 종료로
+  처리한다. (buffered stdin을 쓰지 않는 이유: flush/close가 timeout 없이 무한
+  블록할 수 있어 종료 경로에 별도 closer 스레드가 필요해지고, 그 스레드의
+  스케줄러/수명 관리가 다시 unbounded가 된다 — raw는 close가 close(2) 한 번.)"""
+  mv = memoryview(data)
+  while len(mv) > 0:
+    n = stdin.write(mv)
+    if not n:
+      raise OSError("record stdin write made no progress")
+    mv = mv[n:]
+
+
 class _RecordBufPool:
   """carrot 녹화 캡처의 재사용 버퍼 풀 — 세션 세대 단위.
 
@@ -672,7 +686,7 @@ class GuiApplication:
           break
         ok = True
         try:
-          proc.stdin.write(data)
+          _record_stdin_write_all(proc.stdin, data)
         except Exception:
           ok = False
         buf_pool.put(data)  # write 성공/실패 무관 회수 — 풀 고갈 방지
@@ -741,7 +755,10 @@ class GuiApplication:
       ffmpeg_args = ["chrt", "--other", "0", "taskset", "--cpu-list", "0-3", "nice", "-n", "10", *ffmpeg_args]
 
     try:
-      self._ffmpeg_proc = subprocess.Popen(ffmpeg_args, stdin=subprocess.PIPE)
+      # bufsize=0: raw(unbuffered) stdin — userspace 버퍼가 없어 종료 시 flush가
+      # 필요 없고 close가 close(2) 한 번으로 끝난다(무한 블록 불가, 별도 closer
+      # 스레드 불필요). partial write는 writer의 _record_stdin_write_all이 처리.
+      self._ffmpeg_proc = subprocess.Popen(ffmpeg_args, stdin=subprocess.PIPE, bufsize=0)
     except OSError as e:
       # chrt/taskset 부재 등 — RT 상속 상태로 녹화하느니 시작하지 않는다
       print(f"[REC] failed to launch encoder: {e!r}")
@@ -1207,9 +1224,13 @@ class GuiApplication:
           pass
         return cls._record_proc_dead(proc)
       try:
-        # buffered stdin의 flush/close는 자체 timeout이 없다(파이프 가득+인코더 행이면
-        # 무한 블록) — bounded helper로 EOF를 전달하고, 안 되면 kill로 파이프를 깬다
-        cls._close_encoder_stdin_bounded(proc, timeout=5.0)
+        # stdin은 raw(unbuffered, _init_ffmpeg의 bufsize=0) — close는 close(2) 한
+        # 번이라 블록하지 않고 곧장 EOF가 전달된다 (flush할 userspace 버퍼 없음).
+        # writer는 위 join으로 종료가 확인된 뒤라 동시 접근도 없다. 예외가 나면
+        # EOF 전달 실패이므로 바깥 except의 kill 체인으로 떨어진다.
+        stdin = getattr(proc, "stdin", None)
+        if stdin is not None and not getattr(stdin, "closed", False):
+          stdin.close()
 
         try:
           proc.wait(timeout=10)
@@ -1240,45 +1261,6 @@ class GuiApplication:
         except Exception:
           pass
     return cls._record_proc_dead(proc)
-
-  @staticmethod
-  def _close_encoder_stdin_bounded(proc, timeout: float) -> None:
-    """buffered stdin flush/close를 timeout 안에 끝낸다 — 파이프가 가득 찬 채
-    인코더가 읽지 않으면 flush가 무한 블록하므로 별도 스레드에서 수행하고,
-    timeout 내 안 끝나면 인코더를 kill해 파이프를 깨서 풀어준다 (EOF 전달 대신
-    강제 종료 — bounded 보장; kill 이후의 wait/reap은 호출자 체인이 잇는다)."""
-    stdin = getattr(proc, "stdin", None)
-    if stdin is None or getattr(stdin, "closed", False):
-      return
-
-    def _do_close():
-      try:
-        stdin.flush()
-      except Exception:
-        pass
-      try:
-        stdin.close()
-      except Exception:
-        pass
-
-    try:
-      closer = threading.Thread(target=_do_close, daemon=True)
-      closer.start()
-    except Exception:
-      # 스레드 생성 불가 — 블록 위험을 감수하지 않고 곧장 kill로 파이프를 깬다
-      try:
-        proc.kill()
-      except Exception:
-        pass
-      return
-    closer.join(timeout=timeout)
-    if closer.is_alive():
-      # flush가 블록됨(인코더가 파이프를 읽지 않음) — kill로 풀어준다
-      try:
-        proc.kill()
-      except Exception:
-        pass
-      closer.join(timeout=2.0)
 
   # 잔존 인코더 kill 재시도 최소 간격(초) — prune은 매 프레임 불릴 수 있으므로
   # backoff 없이는 kill이 프레임 속도로 폭주한다

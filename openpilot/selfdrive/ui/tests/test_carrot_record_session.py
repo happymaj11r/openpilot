@@ -11,7 +11,7 @@ import threading
 import types
 
 import openpilot.system.ui.lib.application as app_mod
-from openpilot.system.ui.lib.application import GuiApplication, _RecordBufPool
+from openpilot.system.ui.lib.application import GuiApplication, _RecordBufPool, _record_stdin_write_all
 
 
 def make_app(**over):
@@ -118,7 +118,7 @@ class TestWriterLoop:
     b1, b2 = pool.take(), pool.take()
     wq = queue.Queue()
     writes = []
-    proc = types.SimpleNamespace(stdin=types.SimpleNamespace(write=lambda d: writes.append(bytes(d))))
+    proc = types.SimpleNamespace(stdin=types.SimpleNamespace(write=lambda d: (writes.append(bytes(d)), len(d))[1]))
     for item in (b1, b2, None):
       wq.put(item)
     GuiApplication._record_writer_loop(proc, wq, threading.Event(), pool)
@@ -142,10 +142,44 @@ class TestWriterLoop:
     wq = queue.Queue()
     wq.put(buf)
     wq.put(None)
-    proc = types.SimpleNamespace(stdin=types.SimpleNamespace(write=lambda d: None))
+    proc = types.SimpleNamespace(stdin=types.SimpleNamespace(write=len))
     # writer는 자기 세대(old_pool) 지역 참조로만 반환한다 — 새 풀은 무관
     GuiApplication._record_writer_loop(proc, wq, threading.Event(), old_pool)
     assert old_pool._q.qsize() == 1
+
+
+class TestStdinWriteAll:
+  # raw(unbuffered) stdin은 write가 partial일 수 있다 — write-all loop 계약 고정
+  def test_partial_writes_deliver_full_frame(self):
+    chunks = []
+    def partial_write(mv):
+      n = min(3, len(mv))  # 파이프가 3바이트씩만 받는 상황
+      chunks.append(bytes(mv[:n]))
+      return n
+    stdin = types.SimpleNamespace(write=partial_write)
+    data = bytearray(b"0123456789")
+    _record_stdin_write_all(stdin, data)
+    assert b"".join(chunks) == bytes(data)
+
+  def test_no_progress_raises(self):
+    # 진행 불가(0/None)를 성공으로 오인해 무한 루프하면 안 된다 — 예외로 승격해
+    # writer가 비정상 종료(failure_event) 경로를 타게 한다
+    for stall in (0, None):
+      stdin = types.SimpleNamespace(write=lambda mv, _s=stall: _s)
+      try:
+        _record_stdin_write_all(stdin, bytearray(b"xx"))
+        raise AssertionError("no-progress write must raise")
+      except OSError:
+        pass
+
+  def test_write_exception_propagates(self):
+    def boom(_mv):
+      raise BrokenPipeError("pipe closed")
+    try:
+      _record_stdin_write_all(types.SimpleNamespace(write=boom), bytearray(b"xx"))
+      raise AssertionError("must propagate")
+    except BrokenPipeError:
+      pass
 
 
 class TestCaptureNoThrow:
@@ -217,6 +251,23 @@ class TestTeardownKillChain:
     proc = FakeProc()
     GuiApplication._record_teardown(None, proc)
     assert proc.kill_calls == 0 and proc.terminate_calls == 0
+
+  def test_normal_exit_closes_raw_stdin_once(self):
+    # raw stdin은 flush 없이 close(2) 한 번으로 EOF 전달 — 블록 지점이 없다
+    closed = []
+    proc = FakeProc()
+    proc.stdin = types.SimpleNamespace(closed=False, close=lambda: closed.append(1))
+    GuiApplication._record_teardown(None, proc)
+    assert closed == [1] and proc.kill_calls == 0
+
+  def test_stdin_close_error_falls_through_to_kill_chain(self):
+    # EOF 전달 실패 — 인코더가 스스로 끝나길 기대할 수 없으니 kill 체인으로
+    def bad_close():
+      raise OSError("close failed")
+    proc = FakeProc(alive=True, dies_on_kill=True)
+    proc.stdin = types.SimpleNamespace(closed=False, close=bad_close)
+    resolved = GuiApplication._record_teardown(None, proc)
+    assert proc.kill_calls == 1 and resolved is True
 
 
 class TestCleanupWorker:
@@ -302,7 +353,7 @@ class TestWriterLifecycle:
     old_q = queue.Queue()
     writes = []
     old_proc = types.SimpleNamespace(
-      stdin=types.SimpleNamespace(write=lambda d: writes.append(bytes(d))), poll=lambda: None)
+      stdin=types.SimpleNamespace(write=lambda d: (writes.append(bytes(d)), len(d))[1]), poll=lambda: None)
     old_q.put(old_pool.take())
     old_q.put(None)
     old_fev = threading.Event()
@@ -768,37 +819,44 @@ class TestGateNonBlocking:
     assert app._record_buf_pool._q.qsize() == app._record_buf_count  # buf 회수
 
 
-class TestBoundedStdinClose:
-  class BlockingStdin:
-    """파이프 가득 + 인코더 미소비 상황 — flush가 무한 블록."""
-    closed = False
+class TestRawStdinNoNestedThread:
+  # buffered stdin의 bounded-close helper(중첩 closer 스레드)는 제거됐다 — closer가
+  # UI FIFO53/core5를 상속하거나 추적 밖에서 누적될 여지 자체가 없어야 한다
+  def test_bounded_close_helper_removed(self):
+    assert not hasattr(GuiApplication, "_close_encoder_stdin_bounded")
 
-    def __init__(self):
-      self.unblock = threading.Event()
-
-    def flush(self):
-      self.unblock.wait(timeout=30)  # kill이 파이프를 깨면 풀린다 (테스트에선 Event)
-
-    def close(self):
-      pass
-
-  def test_blocked_flush_falls_through_to_kill(self):
-    stdin = self.BlockingStdin()
-    proc = FakeProc(alive=True)
-    proc.stdin = stdin
-    def kill_and_unblock():
-      proc.kill_calls += 1
-      stdin.unblock.set()  # 실제로는 kill이 파이프를 깨서 flush가 풀림
-    proc.kill = kill_and_unblock
-    GuiApplication._close_encoder_stdin_bounded(proc, timeout=0.2)
-    assert proc.kill_calls == 1  # timeout 안에 kill 진입 (무한 대기 금지)
-
-  def test_normal_close_no_kill(self):
+  def test_teardown_spawns_no_thread(self, monkeypatch):
+    # teardown 경로 전체가 스레드를 만들지 않는다 — Thread 생성을 봉쇄해도 완주
+    def no_threads(*a, **k):
+      raise AssertionError("teardown must not spawn threads")
+    monkeypatch.setattr(app_mod.threading, "Thread", no_threads)
     closed = []
-    proc = FakeProc(alive=True)
-    proc.stdin = types.SimpleNamespace(closed=False, flush=lambda: None, close=lambda: closed.append(1))
-    GuiApplication._close_encoder_stdin_bounded(proc, timeout=2.0)
-    assert closed == [1] and proc.kill_calls == 0
+    proc = FakeProc()
+    proc.stdin = types.SimpleNamespace(closed=False, close=lambda: closed.append(1))
+    resolved = GuiApplication._record_teardown(None, proc)
+    assert resolved is True and closed == [1]
+
+  def test_init_ffmpeg_launches_unbuffered_stdin(self, monkeypatch):
+    # raw close 전제(bufsize=0)를 고정 — buffered로 돌아가면 close가 flush를 물고
+    # 무한 블록할 수 있다
+    from pathlib import Path
+    app = make_app()
+    app._width, app._height, app._target_fps = 4, 4, 20
+    captured = {}
+    def fake_popen(args, **kwargs):
+      captured.update(kwargs)
+      return FakeProc(alive=True)
+    monkeypatch.setattr(app_mod.subprocess, "Popen", fake_popen)
+    started = []
+    class OkThread:
+      def __init__(self, *a, **k):
+        pass
+      def start(self):
+        started.append(1)
+    monkeypatch.setattr(app_mod.threading, "Thread", OkThread)
+    assert app._init_ffmpeg(Path("/tmp/x.mp4")) is True
+    assert captured.get("bufsize") == 0 and captured.get("stdin") is subprocess.PIPE
+    assert started == [1]
 
 
 class TestCloseWindowIndependence:
