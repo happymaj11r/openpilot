@@ -51,6 +51,10 @@ class MainLayout(Widget):
 
   def _sync_screen_record_state(self, requested: bool) -> bool:
     recording = gui_app.is_recording()
+    # 시작 보류(pending: 이전 인코더 정리 대기)는 실패가 아니다 — 파라미터를 꺼서
+    # 사용자 요청을 지우면 정리가 끝나도 재시작이 오지 않는다. 재시도를 유지한다
+    if requested and not recording and gui_app.is_record_start_pending():
+      return recording
     if requested != recording:
       ui_state.params.put_bool_nonblocking("ScreenRecord", recording)
       # 다음 TTL 갱신 전까지 캐시가 예전 값으로 녹화를 되살리지 않도록 동기화

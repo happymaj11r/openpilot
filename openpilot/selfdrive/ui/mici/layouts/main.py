@@ -68,6 +68,10 @@ class MiciMainLayout(Scroller):
   @staticmethod
   def _sync_screen_record_state(requested: bool) -> bool:
     recording = gui_app.is_recording()
+    # 시작 보류(pending: 이전 인코더 정리 대기)는 실패가 아니다 — 파라미터를 꺼서
+    # 사용자 요청을 지우면 정리가 끝나도 재시작이 오지 않는다. 재시도를 유지한다
+    if requested and not recording and gui_app.is_record_start_pending():
+      return recording
     if requested != recording:
       ui_state.params.put_bool_nonblocking("ScreenRecord", recording)
     return recording
