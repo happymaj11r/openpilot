@@ -3,8 +3,12 @@
 per-segment draw_line 계열은 프레임당 수천 Python→raylib 콜과 Vector2 할당으로
 UI를 상시 실행 상태로 만든다 (route 416/41a — big-UI는 최대 1,197콜/frame).
 draw_spline_linear(두께 지원, 시리즈당 1콜) → draw_line_strip(스트로크당 1콜) →
-per-segment 순으로 폴백한다. 가용성은 로드 시 1회 판정하고, 실제 선택된 backend는
-최초 사용 시 프로세스 수명당 1회만 로그(PLOTDRAW)한다.
+per-segment 순으로 폴백한다. 가용성은 로드 시 1회 판정하고, 진단 로그(backend
+PLOTDRAW + legacy 폴백 경고)는 전부 log_backend_once에만 둔다 — draw_polyline은
+어떤 경로에서도 로그를 쓰지 않는다. big-UI는 draw가 uiRender/drawTimeMillis 측정
+안에 중첩이라 draw 경로의 cloudlog가 바깥 지표를 오염시키기 때문 (big-UI는
+log_backend_once를 outer 종료 후 emit_pending_metrics에서, mici는 비중첩이라
+draw 중 즉시 호출).
 
 mici(debug_plot.py)와 big-UI(hud_renderer.py PlotRenderer)가 같은 경로를 쓰도록
 여기에만 폴백/로그 로직을 둔다 — 두 UI가 다시 갈라지지 않게 유지할 것.
@@ -16,7 +20,6 @@ from openpilot.common.swaglog import cloudlog
 HAS_SPLINE = hasattr(rl, "draw_spline_linear")
 HAS_LINE_STRIP = hasattr(rl, "draw_line_strip")
 _backend_logged = False
-_fallback_warned = False
 
 
 def backend_name() -> str:
@@ -25,7 +28,8 @@ def backend_name() -> str:
 
 def log_backend_once(points: int, series: int, stroke: int) -> None:
   """실제 선택된 backend를 프로세스 수명당 1회만 기록 — 진단 로그가 첫 plot
-  프레임을 죽이면 안 되므로 no-throw."""
+  프레임을 죽이면 안 되므로 no-throw. legacy 폴백 경고도 여기서 함께 배출한다
+  (draw_polyline은 log-free 계약)."""
   global _backend_logged
   if _backend_logged:
     return
@@ -33,6 +37,8 @@ def log_backend_once(points: int, series: int, stroke: int) -> None:
   try:
     ver = getattr(rl, "RAYLIB_VERSION", "?")
     cloudlog.warning(f"PLOTDRAW: backend={backend_name()} points={points} series={series} stroke={stroke} raylib={ver}")
+    if not HAS_SPLINE and not HAS_LINE_STRIP:
+      cloudlog.warning("PLOTDRAW: no batch line API in pyray, falling back to per-segment draw_line")
   except Exception:
     pass
 
@@ -40,10 +46,11 @@ def log_backend_once(points: int, series: int, stroke: int) -> None:
 def draw_polyline(pts, n, color, stroke: int = 3) -> None:
   """pts[:n](rl.Vector2 재사용 버퍼)를 연결선으로 그린다.
 
-  line_strip 폴백은 y offset을 누적 적용하므로 호출 후 pts의 y가 ±(stroke//2)
-  이동할 수 있다 — 좌표를 다시 쓸 호출자는 미리 복사해 둘 것.
+  드로잉만 담당하며 어떤 경로에서도 로그를 쓰지 않는다(log-free 계약 —
+  진단 로그는 log_backend_once). line_strip 폴백은 y offset을 누적 적용하므로
+  호출 후 pts의 y가 ±(stroke//2) 이동할 수 있다 — 좌표를 다시 쓸 호출자는
+  미리 복사해 둘 것.
   """
-  global _fallback_warned
   if n < 2:
     return
   if HAS_SPLINE:
@@ -59,12 +66,6 @@ def draw_polyline(pts, n, color, stroke: int = 3) -> None:
         applied = o
       rl.draw_line_strip(pts, n, color)
   else:
-    if not _fallback_warned:
-      _fallback_warned = True
-      try:
-        cloudlog.warning("PLOTDRAW: no batch line API in pyray, falling back to per-segment draw_line")
-      except Exception:
-        pass
     for i in range(1, n):
       x0, y0 = pts[i - 1].x, pts[i - 1].y
       x1, y1 = pts[i].x, pts[i].y

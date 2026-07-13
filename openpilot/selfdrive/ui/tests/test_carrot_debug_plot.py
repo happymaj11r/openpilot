@@ -49,7 +49,6 @@ def make_plot(monkeypatch, *, has_spline, has_strip, plot_index=137, plot_size=P
   monkeypatch.setattr(cpd, "rl", fake)  # 폴리라인 batch(공용 헬퍼)용
   monkeypatch.setattr(cpd, "HAS_SPLINE", has_spline)
   monkeypatch.setattr(cpd, "HAS_LINE_STRIP", has_strip)
-  monkeypatch.setattr(cpd, "_fallback_warned", False)
   monkeypatch.setattr(cpd, "_backend_logged", True)  # backend 로그는 전용 테스트에서만
 
   p = object.__new__(DebugPlot)
@@ -110,7 +109,9 @@ class TestBatchDrawing:
     for j in range(3):
       assert fake.strip_calls[j] == [(x, y + (j - 1)) for x, y in ref]
 
-  def test_legacy_fallback_same_call_count_and_warns_once(self, monkeypatch):
+  def test_legacy_fallback_call_count_and_draw_polyline_log_free(self, monkeypatch):
+    # draw_polyline은 log-free 계약 — legacy 경로 포함 어디서도 cloudlog를 쓰지 않는다
+    # (폴백 경고는 log_backend_once로 이동; 여기선 _backend_logged=True로 억제 상태)
     warnings = []
     p, fake = make_plot(monkeypatch, has_spline=False, has_strip=False)
     monkeypatch.setattr(cpd, "cloudlog", types.SimpleNamespace(warning=warnings.append))
@@ -118,7 +119,7 @@ class TestBatchDrawing:
     p._draw_series(RECT, 1, COLOR, stroke=3)
     # 기존 구현과 동일: (PLOT_MAX-1) segment * stroke 3
     assert len(fake.line_calls) == (PLOT_MAX - 1) * 3 * 2
-    assert len(warnings) == 1
+    assert warnings == []
 
   def test_ring_wrap_partial_fill_preserves_order(self, monkeypatch):
     p, fake = make_plot(monkeypatch, has_spline=True, has_strip=True, plot_index=3, plot_size=17)
@@ -169,15 +170,17 @@ class TestBackendLog:
     assert len(logs) == 1 and "backend=legacy" in logs[0]
 
   def test_legacy_backend_and_fallback_warning_each_once(self, monkeypatch):
-    # legacy에서는 backend 로그와 per-segment 폴백 경고가 각각 정확히 1회
+    # legacy에서는 log_backend_once가 backend 로그와 per-segment 폴백 경고를
+    # 이 순서로 각각 정확히 1회 배출 (mici는 비중첩이라 draw 중 즉시 호출 OK)
     p, _ = make_plot(monkeypatch, has_spline=False, has_strip=False)
     warnings = []
     monkeypatch.setattr(cpd, "cloudlog", types.SimpleNamespace(warning=warnings.append))
     monkeypatch.setattr(cpd, "_backend_logged", False)
     p._draw_series(RECT, 0, COLOR, stroke=3)
     p._draw_series(RECT, 1, COLOR, stroke=3)
-    assert len([w for w in warnings if "backend=legacy" in w]) == 1
-    assert len([w for w in warnings if "no batch line API" in w]) == 1
+    assert len(warnings) == 2
+    assert "backend=legacy" in warnings[0]
+    assert "no batch line API" in warnings[1]
 
   def test_backend_log_failure_swallowed_and_not_retried(self, monkeypatch):
     # 진단 로그 장애가 첫 plot 프레임을 죽이면 안 되고, 다음 프레임 재시도도 없어야 한다
@@ -195,7 +198,8 @@ class TestBackendLog:
     def boom(_):
       raise RuntimeError("log backend down")
     monkeypatch.setattr(cpd, "cloudlog", types.SimpleNamespace(warning=boom))
-    p._draw_series(RECT, 0, COLOR, stroke=3)  # 폴백 경고 실패도 무전파
+    monkeypatch.setattr(cpd, "_backend_logged", False)
+    p._draw_series(RECT, 0, COLOR, stroke=3)  # backend/폴백 경고 실패도 무전파
     assert len(fake.line_calls) == (PLOT_MAX - 1) * 3
 
 

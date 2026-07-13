@@ -253,23 +253,51 @@ class TestHudPlotWiring:
     hr.emit_pending_plot_metrics()
     assert called == [1]
 
+  def _common_sink(self, monkeypatch):
+    # helper(PLOTDRAW)와 계측(PLOTPERF)을 하나의 sink로 — 실제 전역 시간순서 검증용
+    logs = []
+    sink = types.SimpleNamespace(warning=logs.append)
+    monkeypatch.setattr(crm, "cloudlog", sink)
+    monkeypatch.setattr(cpd, "cloudlog", sink)
+    monkeypatch.setattr(cpd, "_backend_logged", False)
+    return logs
+
   def test_backend_log_deferred_and_once_real_helper(self, monkeypatch):
     # 실제 헬퍼 로깅을 살린 채(1회 가드 리셋) 첫 B 프레임 시나리오 재현:
     # draw() 안 cloudlog 0 → emit_pending_metrics()에서 PLOTDRAW 정확히 1회 →
     # 재 draw+emit에도 추가 PLOTDRAW 없음 (헬퍼 프로세스 가드)
-    perf_logs = _capture_logs(monkeypatch)  # PLOTPERF (crm.cloudlog)
-    helper_logs = []
-    monkeypatch.setattr(cpd, "cloudlog", types.SimpleNamespace(warning=helper_logs.append))
-    monkeypatch.setattr(cpd, "_backend_logged", False)
+    logs = self._common_sink(monkeypatch)
     monkeypatch.setattr(cpd, "HAS_SPLINE", True)
     monkeypatch.setattr(cpd, "rl", types.SimpleNamespace(
       draw_spline_linear=lambda pts, n, thick, color: None))
 
     p, state, rect = make_wired(monkeypatch, real_helper=True)
     p.draw(rect, None)  # 첫 plot 프레임
-    assert helper_logs == [] and perf_logs == []  # draw 경로 어디서도 cloudlog 금지
+    assert logs == []  # draw 경로 어디서도 cloudlog 금지
     p.emit_pending_metrics()
-    assert len(helper_logs) == 1 and helper_logs[0].startswith("PLOTDRAW: backend=spline")
+    assert logs == [logs[0]] and logs[0].startswith("PLOTDRAW: backend=spline")
     p.draw(rect, None)
     p.emit_pending_metrics()
-    assert len(helper_logs) == 1  # 추가 PLOTDRAW 없음
+    assert len(logs) == 1  # 추가 PLOTDRAW 없음
+
+  def test_legacy_fallback_full_order_common_sink(self, monkeypatch):
+    # legacy 폴백(spline/strip 부재)에서도 draw() 안 전역 cloudlog 0 —
+    # PLOTDRAW backend=legacy → 폴백 경고 → PLOTPERF가 전부 emit에서 이 순서로
+    logs = self._common_sink(monkeypatch)
+    monkeypatch.setattr(cpd, "HAS_SPLINE", False)
+    monkeypatch.setattr(cpd, "HAS_LINE_STRIP", False)
+    monkeypatch.setattr(cpd, "rl", types.SimpleNamespace(draw_line=lambda *a: None))
+
+    p, state, rect = make_wired(monkeypatch, window=2, real_helper=True)
+    p.draw(rect, None)
+    p.draw(rect, None)  # window=2 완성 + legacy per-segment 폴백 실제 실행
+    assert logs == []  # legacy 경고 포함 draw() 안 무로그
+    p.emit_pending_metrics()
+    assert len(logs) == 3
+    assert logs[0].startswith("PLOTDRAW: backend=legacy")
+    assert "no batch line API" in logs[1]
+    assert "PLOTPERF debugPlot" in logs[2]
+    p.draw(rect, None)
+    p.emit_pending_metrics()
+    # backend/폴백 경고 재로그 없음 (헬퍼 프로세스 가드)
+    assert len([line for line in logs if "backend=" in line or "no batch" in line]) == 2
