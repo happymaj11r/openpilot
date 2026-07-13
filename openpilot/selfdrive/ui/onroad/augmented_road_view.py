@@ -123,6 +123,9 @@ class AugmentedRoadView(CameraView):
     msg = messaging.new_message('uiDebug')
     msg.uiDebug.drawTimeMillis = total * 1000
     self._render_metrics.end(_tok)
+    # 중첩된 debugPlot 계측의 deferred 로그는 uiRender 샘플 종료 뒤에 배출 —
+    # emit 비용이 drawTimeMillis에도, uiRender 윈도에도 들어가지 않는다
+    self._hud_renderer.emit_pending_plot_metrics()
     self._pm.send('uiDebug', msg)
 
   def _handle_mouse_press(self, _):

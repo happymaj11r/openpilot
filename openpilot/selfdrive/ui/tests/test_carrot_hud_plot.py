@@ -4,11 +4,18 @@ route 41a: tizi는 BIG_UI라 mici batch가 실행되지 않고 legacy per-segmen
 draw_line_ex(최대 1,197콜/frame + Vector2 ~1,200개 할당)가 돌았다. 이 테스트는
 big-UI가 공용 batch 헬퍼(carrot_plot_draw)로 시리즈당 1콜을 쓰고, 좌표/순서/라벨이
 기존 구현과 동일함을 고정한다.
+
+big-UI는 PlotRenderer.draw()가 uiRender/drawTimeMillis 측정 안에 중첩돼 있으므로,
+draw() 경로에서는 계측이 절대 로그를 쓰지 않고(deferred) 바깥 구간 종료 후
+emit_pending에서만 배출되는 불변식도 고정한다.
 """
 import types
 
+import openpilot.selfdrive.ui.carrot_plot_draw as cpd
 import openpilot.selfdrive.ui.onroad.hud_renderer as hud
+import openpilot.system.ui.lib.carrot_render_metrics as crm
 from openpilot.selfdrive.ui.onroad.hud_renderer import PlotRenderer
+from openpilot.system.ui.lib.carrot_render_metrics import SectionMetrics
 
 PLOT_MAX = PlotRenderer.PLOT_MAX
 
@@ -96,3 +103,135 @@ class TestHudPlotBatch:
     p, calls = make_renderer(monkeypatch)
     p._draw_plotting(0, 350.0, 40.0, object(), None)
     assert calls["backend"] == [(PLOT_MAX, 3, 3)]
+
+  def test_helper_end_to_end_spline(self, monkeypatch):
+    # hud.plot_draw를 fake로 바꾸지 않고 실제 공용 헬퍼를 경유 — big-UI가 spline
+    # backend에서 시리즈당 draw_spline_linear 1콜을 내는 실제 wiring을 고정한다
+    spline_calls = []
+    monkeypatch.setattr(cpd, "rl", types.SimpleNamespace(
+      draw_spline_linear=lambda pts, n, thick, color: spline_calls.append((n, thick))))
+    monkeypatch.setattr(cpd, "HAS_SPLINE", True)
+    monkeypatch.setattr(cpd, "_backend_logged", True)  # cloudlog 억제
+    monkeypatch.setattr(hud, "draw_text_ui_style", lambda *a, **k: None)
+
+    p = object.__new__(PlotRenderer)
+    p._plot_size, p._plot_index = 50, 7
+    p._plot_queue = [[float(i % 5) for i in range(PLOT_MAX)] for _ in range(3)]
+    p._plot_min, p._plot_max = -2.0, 4.0
+    p._plot_height, p._plot_dx = 300.0, 2.0
+    p._pts = [FakeVec() for _ in range(PLOT_MAX)]
+    p._draw_plotting(0, 350.0, 40.0, object(), None)
+    assert spline_calls == [(50, 3.0)]
+
+
+class FakeGate:
+  def __init__(self, state):
+    self._state = state
+
+  @property
+  def effective_mode(self):
+    return self._state["mode"]
+
+
+def _capture_logs(monkeypatch):
+  logs = []
+  monkeypatch.setattr(crm, "cloudlog", types.SimpleNamespace(warning=logs.append))
+  return logs
+
+
+def make_wired(monkeypatch, *, mode=1, window=100):
+  """draw() 레벨 wiring 테스트용 — 전역 의존은 stub, 필드/계측은 실물."""
+  state = {"mode": mode, "rec": (False, 0)}
+  monkeypatch.setattr(hud, "plot_sched_gate", FakeGate(state))
+  monkeypatch.setattr(hud, "gui_app", types.SimpleNamespace(recording_phase=lambda: state["rec"]))
+  monkeypatch.setattr(hud, "ui_state", types.SimpleNamespace(
+    sm=types.SimpleNamespace(alive={"carState": True, "longitudinalPlan": True})))
+  monkeypatch.setattr(hud, "plot_draw", types.SimpleNamespace(
+    log_backend_once=lambda *a: None, draw_polyline=lambda *a, **k: None))
+  monkeypatch.setattr(hud, "draw_text_ui_style", lambda *a, **k: None)
+
+  p = object.__new__(PlotRenderer)
+  p._show_plot_mode_prev = -1
+  p._plot_size, p._plot_index = 0, 0
+  p._plot_queue = [[0.0] * PLOT_MAX for _ in range(3)]
+  p._plot_min, p._plot_max = 0.0, 0.0
+  p._plot_x, p._plot_y = 350.0, 40.0
+  p._plot_height, p._plot_dx = 300.0, 2.0
+  p._pts = [FakeVec() for _ in range(PLOT_MAX)]
+  p._plot_metrics = SectionMetrics("debugPlot", window=window, deferred=True)
+  p._make_plot_data = lambda sm, mode: ([0.1, 0.2, 0.3], "T")
+  rect = types.SimpleNamespace(width=1400.0, x=0.0, y=0.0)
+  return p, state, rect
+
+
+class TestHudPlotWiring:
+  """PlotRenderer.draw()의 phase/begin/end 배치와 nested-emit 오염 부재를 고정."""
+
+  def test_draw_never_logs_inside_frame(self, monkeypatch):
+    # 핵심 불변식(지피짱 BLOCK 해소): 윈도가 차는 프레임에도 draw() 안에서는
+    # cloudlog가 절대 불리지 않는다 — drawTimeMillis/uiRender 오염 원천 차단
+    logs = _capture_logs(monkeypatch)
+    p, _, rect = make_wired(monkeypatch, window=2)
+    for _ in range(5):
+      p.draw(rect, None)  # 완성 윈도 2개가 생기는 횟수
+    assert logs == []
+    p.emit_pending_metrics()  # 바깥 구간 종료 후 배출
+    assert len(logs) == 2 and all("PLOTPERF debugPlot:" in line for line in logs)
+
+  def test_mode_off_moves_partial_to_pending_without_log(self, monkeypatch):
+    logs = _capture_logs(monkeypatch)
+    p, state, rect = make_wired(monkeypatch)
+    for _ in range(3):
+      p.draw(rect, None)
+    state["mode"] = 0  # plot OFF (D→E 전환 프레임)
+    p.draw(rect, None)  # early return이지만 set_phase가 partial을 pending으로
+    assert logs == []  # 전환 프레임 draw 안에서도 로그 금지
+    p.emit_pending_metrics()
+    assert len(logs) == 1
+    assert "phase=1/False/0" in logs[0] and "n=3" in logs[0]
+
+  def test_mode_off_repeat_emits_nothing(self, monkeypatch):
+    logs = _capture_logs(monkeypatch)
+    p, state, rect = make_wired(monkeypatch, mode=0)
+    for _ in range(5):
+      p.draw(rect, None)  # 동일 phase(OFF) 반복 — 샘플도 pending도 없어야 한다
+    p.emit_pending_metrics()
+    assert logs == [] and len(p._plot_metrics._wall) == 0
+
+  def test_recording_session_change_separates_windows(self, monkeypatch):
+    logs = _capture_logs(monkeypatch)
+    p, state, rect = make_wired(monkeypatch)
+    state["rec"] = (True, 1)
+    p.draw(rect, None)
+    p.draw(rect, None)
+    state["rec"] = (True, 2)  # 60초 회전 — recording bool은 True→True
+    p.draw(rect, None)
+    p.emit_pending_metrics()
+    assert len(logs) == 1
+    assert "phase=1/True/1" in logs[0] and "n=2" in logs[0]
+
+  def test_narrow_rect_still_records_sample(self, monkeypatch):
+    _capture_logs(monkeypatch)
+    p, _, rect = make_wired(monkeypatch)
+    rect.width = 800.0  # rect.width < 1200 경로에도 end가 있어 샘플이 기록된다
+    p.draw(rect, None)
+    assert len(p._plot_metrics._wall) == 1
+
+  def test_make_plot_data_exception_drops_sample(self, monkeypatch):
+    _capture_logs(monkeypatch)
+    p, _, rect = make_wired(monkeypatch)
+    def boom(sm, mode):
+      raise RuntimeError("cereal down")
+    p._make_plot_data = boom
+    p.draw(rect, None)  # 예외 전파 없이 해당 프레임 샘플만 drop
+    assert len(p._plot_metrics._wall) == 0
+
+  def test_hud_renderer_delegates_emit(self, monkeypatch):
+    hr = object.__new__(hud.HudRenderer)
+    hr._plot_renderer = None
+    hr.emit_pending_plot_metrics()  # plot 미생성 상태에서 no-op
+
+    called = []
+    hr._plot_renderer = types.SimpleNamespace(emit_pending_metrics=lambda: called.append(1))
+    hr.emit_pending_plot_metrics()
+    assert called == [1]

@@ -233,6 +233,12 @@ class HudRenderer(Widget):
   def user_interacting(self) -> bool:
     return self._exp_button.is_pressed
 
+  def emit_pending_plot_metrics(self) -> None:
+    """중첩된 plot 계측의 deferred 로그 배출 — augmented_road_view가 drawTimeMillis
+    확정·uiRender.end() 후에 호출한다."""
+    if self._plot_renderer is not None:
+      self._plot_renderer.emit_pending_metrics()
+
   def _draw_set_speed(self, rect: rl.Rectangle) -> None:
     """Draw the MAX speed indicator box."""
     set_speed_width = UI_CONFIG.set_speed_width_metric if ui_state.is_metric else UI_CONFIG.set_speed_width_imperial
@@ -1208,8 +1214,10 @@ class PlotRenderer:
     # 1,197콜 + Vector2 ~1,200개 할당으로 UI CPU를 크게 소비했다 (route 41a)
     self._pts = [rl.Vector2(0, 0) for _ in range(self.PLOT_MAX)]
     # wall/cpu 분리 계측 — 선점 대기와 실제 렌더 비용 구분 (window 100 ≈ 저FPS에서도
-    # 짧은 진단 단계 안에 clean 윈도 확보)
-    self._plot_metrics = SectionMetrics("debugPlot", window=100)
+    # 짧은 진단 단계 안에 clean 윈도 확보). big-UI는 draw()가 uiRender/drawTimeMillis
+    # 측정 안에 중첩되므로 deferred — draw() 안에서는 pending 이동만 하고, 실제
+    # 로그(sort/문자열/cloudlog)는 바깥 구간 종료 후 emit_pending_metrics()에서 배출
+    self._plot_metrics = SectionMetrics("debugPlot", window=100, deferred=True)
 
   def _clear(self):
     self._plot_size = 0
@@ -1441,3 +1449,9 @@ class PlotRenderer:
       font=font, border_width=2.0, shadow_offset=4.0, align='center_bottom',
     )
     self._plot_metrics.end(_tok)
+
+  def emit_pending_metrics(self) -> None:
+    """완성된 계측 윈도의 실제 로그 배출. draw()는 uiRender/drawTimeMillis 측정 안에
+    중첩돼 있어 로그를 쓰면 바깥 지표에 주기적 spike가 찍힌다 — 반드시 바깥 구간
+    종료 후(augmented_road_view에서 uiRender.end() 뒤)에 호출할 것."""
+    self._plot_metrics.emit_pending()
