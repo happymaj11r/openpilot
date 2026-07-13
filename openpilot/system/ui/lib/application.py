@@ -605,14 +605,19 @@ class GuiApplication:
           mismatch = True  # 텍스처 재생성 등 — 세대 불일치는 sync로 가도 같으니 드랍
         else:
           frame_ready = pbo.retrieve_into(buf)  # 직전 캡처 프레임 (첫 캡처는 False)
-          rl.rl_enable_framebuffer(self._render_texture.id)
+          rlgl_ok = True
           try:
-            pbo.issue(tex.width, tex.height)
-          finally:
-            # 기본 framebuffer 복원은 무조건 — rt FBO가 바인드된 채 벗어나면
-            # 다음 프레임이 화면 대신 rt에 그려진다 (issue는 no-throw 계약이지만 방어)
-            rl.rl_disable_framebuffer()
-          if not pbo.ok:
+            try:
+              rl.rl_enable_framebuffer(self._render_texture.id)
+              pbo.issue(tex.width, tex.height)
+            finally:
+              # enable 자체의 예외 포함 어떤 경로든 기본 framebuffer 복원 —
+              # rt FBO가 바인드된 채 벗어나면 다음 프레임이 화면 대신 rt에
+              # 그려진다 (enable 미실행이었으면 0→0 재바인드라 무해)
+              rl.rl_disable_framebuffer()
+          except Exception:
+            rlgl_ok = False  # rlgl 계층 실패 — PBO GL 오류와 동일하게 폴백
+          if not rlgl_ok or not pbo.ok:
             # GL 오류 — retrieve 내용도 신뢰하지 않고 이번 프레임을 sync로 다시 뜬다
             self._disable_record_pbo("gl error")
             pbo = None

@@ -106,7 +106,12 @@ class PboReadback:
       if not self.ok:
         self.release()
     except Exception:
+      # 부분 초기화 잔재 정리 — PACK_BUFFER 바인딩이 남으면 이후 모든 readback
+      # (동기 폴백 포함)의 pixels 인자가 PBO 오프셋으로 해석되고, 생성된 PBO를
+      # 반납하지 않으면 크기 세대 교체마다 GL 자원이 샌다
       self.ok = False
+      self._safe_unbind()
+      self.release()
 
   def _drain_errors(self) -> None:
     # raylib이 남겨 둔 이전 GL 오류가 우리 검증을 오염시키지 않게 비운다 (bounded)
@@ -114,17 +119,27 @@ class PboReadback:
       if self._gl.glGetError() == GL_NO_ERROR:
         break
 
+  def _safe_unbind(self) -> None:
+    # 예외 경로의 최후 바인딩 복원 — 이것마저 실패하면 GL 컨텍스트가 죽은 것 (조용히)
+    try:
+      self._gl.glBindBuffer(GL_PIXEL_PACK_BUFFER, 0)
+    except Exception:
+      pass
+
   def issue(self, width: int, height: int) -> bool:
-    """현재 READ framebuffer → PBO 비동기 전송 시작 (논블로킹)."""
+    """현재 READ framebuffer → PBO 비동기 전송 시작 (논블로킹). 예외 경로 포함
+    PACK_BUFFER 바인딩 복원을 보장한다."""
     if not self.ok:
       return False
+    gl = self._gl
     try:
-      gl = self._gl
-      gl.glBindBuffer(GL_PIXEL_PACK_BUFFER, self._ids[self._next])
-      # PBO 바인드 상태의 pixels 인자는 포인터가 아니라 PBO 안 오프셋(0)이다
-      gl.glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE,
-                      self._ffi.cast("void *", 0))
-      gl.glBindBuffer(GL_PIXEL_PACK_BUFFER, 0)
+      try:
+        gl.glBindBuffer(GL_PIXEL_PACK_BUFFER, self._ids[self._next])
+        # PBO 바인드 상태의 pixels 인자는 포인터가 아니라 PBO 안 오프셋(0)이다
+        gl.glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE,
+                        self._ffi.cast("void *", 0))
+      finally:
+        gl.glBindBuffer(GL_PIXEL_PACK_BUFFER, 0)  # glReadPixels 예외에도 바인딩 잔류 금지
       if gl.glGetError() != GL_NO_ERROR:
         self.ok = False
         return False
@@ -133,29 +148,49 @@ class PboReadback:
       return True
     except Exception:
       self.ok = False
+      self._safe_unbind()  # finally의 unbind 자체가 던진 경우까지 복원 재시도
       return False
 
   def retrieve_into(self, dst) -> bool:
     """직전 issue 프레임을 dst(재사용 bytearray)로 복사. 한 캡처 간격 전에 시작한
-    DMA라 map이 GPU를 기다리지 않는다."""
+    DMA라 map이 GPU를 기다리지 않는다. 어떤 실패든 unmap/unbind를 보장하고
+    ok=False로 수렴한다."""
     if not self.ok or self._pending is None:
       return False
+    gl = self._gl
+    idx, self._pending = self._pending, None  # 성패 무관 소모 — stale frame 재시도 금지
+    mapped = False
     try:
-      gl = self._gl
-      gl.glBindBuffer(GL_PIXEL_PACK_BUFFER, self._ids[self._pending])
-      ptr = gl.glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, self.data_size, GL_MAP_READ_BIT)
-      got = ptr != self._ffi.NULL
-      if got:
-        self._ffi.memmove(dst, ptr, self.data_size)
-        gl.glUnmapBuffer(GL_PIXEL_PACK_BUFFER)
-      gl.glBindBuffer(GL_PIXEL_PACK_BUFFER, 0)
-      self._pending = None
-      if not got or gl.glGetError() != GL_NO_ERROR:
+      got = False
+      unmap_ok = True
+      try:
+        gl.glBindBuffer(GL_PIXEL_PACK_BUFFER, self._ids[idx])
+        ptr = gl.glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, self.data_size, GL_MAP_READ_BIT)
+        mapped = ptr != self._ffi.NULL
+        if mapped:
+          self._ffi.memmove(dst, ptr, self.data_size)
+          got = True
+      finally:
+        if mapped:
+          # GL_FALSE = 전송 중 데이터 저장소 손상(디스플레이 모드 변경 등) —
+          # map으로 복사한 내용도 undefined이므로 프레임을 버려야 한다
+          unmap_ok = bool(gl.glUnmapBuffer(GL_PIXEL_PACK_BUFFER))
+          mapped = False
+        gl.glBindBuffer(GL_PIXEL_PACK_BUFFER, 0)
+      if not got or not unmap_ok or gl.glGetError() != GL_NO_ERROR:
         self.ok = False
         return False
       return True
     except Exception:
       self.ok = False
+      if mapped:
+        # finally의 unmap 자체가 던져 unbind까지 못 간 경우 — mapped 채로 두면
+        # 드라이버가 저장소를 잠근 상태가 유지된다. 한 번 더 시도 후 바인딩 복원
+        try:
+          gl.glUnmapBuffer(GL_PIXEL_PACK_BUFFER)
+        except Exception:
+          pass
+      self._safe_unbind()
       return False
 
   def reset(self) -> None:

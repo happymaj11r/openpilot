@@ -327,17 +327,25 @@ class TestCaptureNoThrow:
 
 class _FakeGL:
   """PboReadback의 GL 계약을 고정하는 가짜 — 실제 cffi cdata(GLuint[2], NULL,
-  from_buffer 포인터)와 상호작용해 바인딩 계층까지 함께 검증한다."""
+  from_buffer 포인터)와 상호작용해 바인딩 계층까지 함께 검증한다.
+  주입 플래그로 각 GL 단계의 예외/실패를 모사한다 (예외 경로의 unmap/unbind
+  보장이 리뷰 blocker였다)."""
 
-  def __init__(self, ffi, map_null=False):
+  def __init__(self, ffi, map_null=False, unmap_result=1, unmap_raises=False,
+               bufferdata_raises=False, readpixels_raises=False):
     self.ffi = ffi
     self.map_null = map_null
+    self.unmap_result = unmap_result
+    self.unmap_raises = unmap_raises
+    self.bufferdata_raises = bufferdata_raises
+    self.readpixels_raises = readpixels_raises
     self.stores: dict[int, bytearray] = {}  # PBO id → 저장소
     self.bound = 0
     self.fb = b""            # glReadPixels가 읽을 '현재 framebuffer' 픽셀
     self.errors: list[int] = []  # glGetError가 순서대로 돌려줄 주입 오류
     self.bind_history: list[int] = []
     self.deleted: list[int] = []
+    self.unmap_calls = 0
     self._next_id = 1
     self._last_map = None    # from_buffer cdata 수명 유지
 
@@ -359,10 +367,14 @@ class _FakeGL:
     self.bind_history.append(buf)
 
   def glBufferData(self, target, size, data, usage):
+    if self.bufferdata_raises:
+      raise RuntimeError("alloc failed")
     if self.bound:
       self.stores[self.bound] = bytearray(int(size))
 
   def glReadPixels(self, x, y, w, h, fmt, typ, ptr):
+    if self.readpixels_raises:
+      raise RuntimeError("read failed")
     if self.bound and self.bound in self.stores:
       self.stores[self.bound][:] = self.fb  # DMA 완료를 즉시로 모사
 
@@ -373,7 +385,10 @@ class _FakeGL:
     return self._last_map
 
   def glUnmapBuffer(self, target):
-    return 1
+    self.unmap_calls += 1
+    if self.unmap_raises:
+      raise RuntimeError("unmap failed")
+    return self.unmap_result
 
 
 def make_pbo(size=16, **gl_kwargs):
@@ -444,6 +459,64 @@ class TestPboReadback:
     assert sorted(gl.deleted) == [1, 2] and pbo.ok is False
     pbo.release()  # 이중 호출 안전 (ids는 이미 None)
     assert sorted(gl.deleted) == [1, 2]
+
+  # --- 예외 주입: 어떤 단계가 실패해도 unmap/unbind/release가 보장돼야 한다
+  # (PACK_BUFFER 바인딩이 남으면 동기 폴백의 readback까지 PBO 오프셋으로 오염)
+
+  def test_bufferdata_exception_unbinds_and_releases(self):
+    ffi = cffi.FFI()
+    ffi.cdef(pbo_mod._GL_CDEF)
+    gl = _FakeGL(ffi, bufferdata_raises=True)
+    pbo = pbo_mod.PboReadback(ffi, gl, 16)
+    assert pbo.ok is False
+    assert gl.bind_history[-1] == 0        # 부분 초기화 예외에도 바인딩 복원
+    assert sorted(gl.deleted) == [1, 2]    # 생성된 PBO 반납 — 세대 교체 누수 금지
+
+  def test_readpixels_exception_unbinds(self):
+    pbo, gl = make_pbo(16)
+    gl.readpixels_raises = True
+    assert pbo.issue(2, 2) is False and pbo.ok is False
+    assert gl.bind_history[-1] == 0
+
+  def test_unmap_false_rejects_frame_and_disables(self):
+    # GL_FALSE = 전송 중 저장소 손상 — map으로 복사한 내용은 undefined이므로
+    # 프레임을 성공 처리하면 깨진 프레임이 인코더로 들어간다
+    pbo, gl = make_pbo(16)
+    gl.fb = b"A" * 16
+    pbo.issue(2, 2)
+    gl.unmap_result = 0
+    assert pbo.retrieve_into(bytearray(16)) is False and pbo.ok is False
+    assert gl.unmap_calls == 1 and gl.bind_history[-1] == 0
+
+  def test_unmap_exception_still_unbinds(self):
+    pbo, gl = make_pbo(16)
+    gl.fb = b"A" * 16
+    pbo.issue(2, 2)
+    gl.unmap_raises = True
+    assert pbo.retrieve_into(bytearray(16)) is False and pbo.ok is False
+    assert gl.unmap_calls == 2             # finally 실패 후 except에서 재시도
+    assert gl.bind_history[-1] == 0        # _safe_unbind가 복원
+
+  def test_memmove_exception_unmaps_and_unbinds(self):
+    ffi = cffi.FFI()
+    ffi.cdef(pbo_mod._GL_CDEF)
+    gl = _FakeGL(ffi)
+
+    class _RaisingMemmoveFfi:
+      NULL = ffi.NULL
+      new = staticmethod(ffi.new)
+      cast = staticmethod(ffi.cast)
+      @staticmethod
+      def memmove(*_a):
+        raise RuntimeError("copy failed")
+
+    pbo = pbo_mod.PboReadback(_RaisingMemmoveFfi, gl, 16)
+    assert pbo.ok
+    gl.fb = b"A" * 16
+    pbo.issue(2, 2)
+    assert pbo.retrieve_into(bytearray(16)) is False and pbo.ok is False
+    assert gl.unmap_calls == 1             # map된 채 방치 금지 — finally가 unmap
+    assert gl.bind_history[-1] == 0
 
 
 class _FakeAppPbo:
@@ -532,6 +605,20 @@ class TestCaptureAsyncPbo:
     assert app._ffmpeg_queue.qsize() == 2
     out = capsys.readouterr().out
     assert out.count("sync fallback (gl error)") == 1
+
+  def test_rl_enable_exception_falls_back_to_sync_same_frame(self, monkeypatch, capsys):
+    # rlgl 계층(enable) 예외도 PBO GL 오류와 동일 폴백 — 프레임 무손실 + 영구 sync.
+    # enable이 try 밖이면 rt FBO가 바인드된 채 남아 다음 프레임이 rt에 그려진다
+    pbo = _FakeAppPbo(16, frames=[b"P" * 16])
+    app, fb_binds = self._async_app(monkeypatch, pbo)
+    def enable_boom(_fbo):
+      raise RuntimeError("rlgl enable failed")
+    monkeypatch.setattr(app_mod.rl, "rl_enable_framebuffer", enable_boom)
+    app._capture_record_frame()
+    assert fb_binds == [0]  # enable은 실패했어도 disable(복원)은 무조건 수행
+    assert app._ffmpeg_queue.qsize() == 1  # sync 폴백이 같은 프레임을 채웠다
+    assert app._record_pbo_disabled is True and pbo.released is True
+    assert capsys.readouterr().out.count("sync fallback (gl error)") == 1
 
   def test_size_mismatch_counted_once_without_sync_retry(self, monkeypatch):
     # 텍스처/풀 세대 불일치는 PBO·sync 어느 쪽으로도 같은 결과 — 이중 계수 금지
