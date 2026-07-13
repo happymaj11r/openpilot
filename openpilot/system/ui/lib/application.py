@@ -253,6 +253,19 @@ class MouseState:
       self._prev_mouse_event[slot] = ev
 
 
+class _DeadThreadMarker:
+  """정리 스레드 없이 인코더만 추적해야 할 때(동기 fallback 실패 등) 정리 목록의
+  스레드 자리에 두는 마커 — prune/join이 요구하는 인터페이스만 제공한다."""
+
+  @staticmethod
+  def is_alive() -> bool:
+    return False
+
+  @staticmethod
+  def join(timeout=None) -> None:
+    return
+
+
 class _RecordBufPool:
   """carrot 녹화 캡처의 재사용 버퍼 풀 — 세션 세대 단위.
 
@@ -358,17 +371,22 @@ class GuiApplication:
     self._record_buf_count = 6
     self._record_buf_pool: _RecordBufPool | None = None
     # 비동기 인코더 정리(60초 회전/stop에서 UI 스레드의 428/538ms 정지 제거,
-    # route 41d) — (스레드, 인코더 proc) 쌍으로 보관해 앱 종료 시 timeout이 지나면
-    # 인코더를 직접 kill/reap할 수 있게 한다. bounded: 2개 이상 밀리면 시작을 미룬다
-    self._record_cleanups: list[tuple[threading.Thread, subprocess.Popen | None]] = []
+    # route 41d) — [스레드, 인코더 proc, 마지막 kill 시각] 항목으로 보관해 스레드가
+    # 끝나도 인코더가 잔존하면 추적을 유지하고(backoff 재kill), 앱 종료 시 직접
+    # kill/reap한다. bounded: 2개 이상 밀리면 새 녹화 시작을 미룬다
+    self._record_cleanups: list[list] = []
     self._record_start_deferred_logged = False
     # 시작 보류(pending) 상태 — 이전 정리가 밀려 잠시 미룬 것은 실패가 아니므로
     # MainLayout이 ScreenRecord 파라미터를 꺼서 사용자 요청을 지우면 안 된다
     self._record_start_pending = False
     # 캡처 드랍 관측 카운터 (세션별) — 드랍은 조용히 일어나면 '로그 0 = 드랍 0'을
     # 검증할 수 없고, 드랍된 프레임은 계측 표본에서도 빠져 성능이 좋아 보인다.
-    # 매 프레임 로깅은 렌더를 오염시키므로 stop/회전 시 요약 한 줄만 배출한다
-    self._record_drop_counts = dict.fromkeys(("pool_empty", "queue_full", "size_mismatch", "capture_error"), 0)
+    # 매 프레임 로깅은 렌더를 오염시키므로 stop/회전 시 요약 한 줄만 배출한다.
+    # stop_gate = writer 종료/정지 후의 늦은 enqueue가 반려된 횟수 (소유권 소실 방지)
+    self._record_drop_counts = dict.fromkeys(("pool_empty", "queue_full", "size_mismatch", "capture_error", "stop_gate"), 0)
+    # enqueue gate 락 (세션별) — writer의 terminal drain과 UI의 늦은 enqueue를
+    # 직렬화해, drain 후에 큐로 들어간 버퍼가 소유자 없이 소실되는 race를 막는다
+    self._ffmpeg_enqueue_lock: threading.Lock | None = None
 
   def _new_record_path(self) -> Path:
     self._record_dir.mkdir(parents=True, exist_ok=True)
@@ -411,7 +429,11 @@ class GuiApplication:
     out_path = self._new_record_path()
     if not self._init_ffmpeg(out_path):
       # 강등 런처 없이 ffmpeg를 띄우면 UI의 RT 스케줄링을 상속해 주행 프로세스를
-      # 굶기므로(2026-07-10 인게이지 해제 사고) 녹화를 시작하지 않는다 (fail-closed)
+      # 굶기므로(2026-07-10 인게이지 해제 사고) 녹화를 시작하지 않는다 (fail-closed).
+      # launch/writer-start 실패도 연속 실패 쿨다운 정책에 포함한다 — MainLayout의
+      # 파라미터-off와 별개로, 재시도 폭주를 카운터 차원에서도 막는다
+      self._record_fail_count += 1
+      self._record_fail_t = time.monotonic()
       print("[REC] failed to start encoder, recording aborted")
       return
 
@@ -496,11 +518,23 @@ class GuiApplication:
         rl.unload_image(image)
         image = None
         self._capture_metrics.end(cap_tok)
-        try:
-          self._ffmpeg_queue.put_nowait(buf)
-          buf = None  # 소유권 이동 — writer가 반환
-        except queue.Full:
-          counts["queue_full"] += 1
+        # enqueue gate: writer의 terminal drain과 락으로 직렬화 — writer가 비정상
+        # 종료해 큐를 비운 '뒤'에 넣는 버퍼는 소유자가 없어 영구 소실되므로,
+        # stop/failure가 표시된 세션에는 넣지 않고 반려한다 (buf는 finally가 회수)
+        lock = self._ffmpeg_enqueue_lock
+        stop_ev = self._ffmpeg_stop_event
+        if lock is None:
+          counts["stop_gate"] += 1  # 세션 경계(detach 후) — 반려
+        else:
+          with lock:
+            if (stop_ev is not None and stop_ev.is_set()) or self._record_failure_event.is_set():
+              counts["stop_gate"] += 1
+            else:
+              try:
+                self._ffmpeg_queue.put_nowait(buf)
+                buf = None  # 소유권 이동 — writer가 반환
+              except queue.Full:
+                counts["queue_full"] += 1
       else:
         counts["size_mismatch"] += 1  # 텍스처 재생성 등 — 샘플/프레임 드랍, finally가 회수
     except Exception:
@@ -543,7 +577,7 @@ class GuiApplication:
       # 실패를 감지하므로 (fail-closed), 여기서는 기록만 남긴다
       print(f"[REC] encoder kill FAILED: {e!r}")
 
-  def _record_writer_thread(self, proc, writer_queue, stop_event, failure_event, buf_pool):
+  def _record_writer_thread(self, proc, writer_queue, stop_event, failure_event, buf_pool, enqueue_lock):
     # 스레드도 UI의 RT 스케줄링을 상속하므로 시작하자마자 강등 — 실패하면 FIFO 53으로
     # 프레임을 쓰게 되므로 인코더까지 함께 중단한다 (fail-closed).
     # 세션 객체는 전부 인자로 받은 지역 참조이며 여기서 self._ffmpeg_*를 다시 읽지
@@ -589,18 +623,25 @@ class GuiApplication:
       # 정지 요청 없이 라이터가 끝났다 = 강등/검증 실패, stdin write 예외 등 비정상 종료.
       # 인코더 프로세스가 살아 있어도(kill 실패 포함) 렌더 루프가 poll() 대신 이 신호로
       # 실패를 감지해 녹화를 멈춘다 (fail-closed). 예상 밖 예외로 죽는 경로까지 포괄한다.
+      # stop_event도 함께 set — UI의 enqueue gate가 즉시 닫혀 늦은 캡처가 반려된다
       if stop_event is None or not stop_event.is_set():
         failure_event.set()
-      # loop 진입 전 실패(강등/검증)에도 큐 잔여 버퍼를 회수한다 — writer가 검증하는
-      # 최대 1초 동안 캡처가 이미 큐에 버퍼를 넣고 있으므로, 여기서 안 거두면
-      # 실패 한 번에 풀이 최대 전량 소실된다 (loop 내부 드레인과 중복 실행은 멱등)
+        if stop_event is not None:
+          stop_event.set()
+      # terminal drain — loop 진입 전 실패(강등/검증)에도 큐 잔여 버퍼를 회수한다
+      # (검증 최대 1초 동안 캡처가 이미 큐에 넣고 있으므로, 안 거두면 실패 한 번에
+      # 풀이 전량 소실). enqueue gate 락 아래에서 수행해 UI가 나중에 넣는 buf가
+      # drain 뒤에 남는 interleaving을 차단한다: UI가 락을 먼저 잡으면 put 후
+      # 여기서 회수되고, 여기가 먼저면 Event가 이미 set이라 UI가 반려한다
       if writer_queue is not None and buf_pool is not None:
-        while True:
-          try:
-            item = writer_queue.get_nowait()
-          except queue.Empty:
-            break
-          buf_pool.put(item)
+        drain_lock = enqueue_lock if enqueue_lock is not None else threading.Lock()
+        with drain_lock:
+          while True:
+            try:
+              item = writer_queue.get_nowait()
+            except queue.Empty:
+              break
+            buf_pool.put(item)
 
   @staticmethod
   def _record_writer_loop(proc, writer_queue, stop_event, buf_pool):
@@ -696,22 +737,24 @@ class GuiApplication:
       return False
     self._ffmpeg_queue = queue.Queue(maxsize=8) # 60 -> 8, 메모리 사용량 줄이기 위해 버퍼 크기 감소
     self._ffmpeg_stop_event = threading.Event()
+    self._ffmpeg_enqueue_lock = threading.Lock()
     # 세션 튜플은 Thread.start() 전에 고정해 args로 넘긴다 — start() 직후 같은/다음
     # 프레임의 stop·회전이 self._ffmpeg_*를 끊거나 새 세션으로 바꿔도, 늦게 실행된
     # writer는 자기 세션 객체만 본다 (writer는 self._ffmpeg_*를 다시 읽지 않는 계약)
     session = (self._ffmpeg_proc, self._ffmpeg_queue, self._ffmpeg_stop_event,
-               self._record_failure_event, self._record_buf_pool)
+               self._record_failure_event, self._record_buf_pool, self._ffmpeg_enqueue_lock)
     try:
       self._ffmpeg_thread = threading.Thread(target=self._record_writer_thread, args=session, daemon=True)
       self._ffmpeg_thread.start()
     except Exception as e:
       # writer 없는 인코더를 방치하면 안 된다 — 즉시 kill/reap하고 참조를 정리해
-      # 정상 시작-실패 경로(fail count/쿨다운)로 합류시킨다 (rollback)
+      # 연속 실패 쿨다운 경로에 합류시킨다 (rollback; 카운트는 start_recording에서)
       print(f"[REC] failed to start writer thread: {e!r}")
       proc = self._ffmpeg_proc
       self._ffmpeg_thread = None
       self._ffmpeg_queue = None
       self._ffmpeg_stop_event = None
+      self._ffmpeg_enqueue_lock = None
       self._ffmpeg_proc = None
       self._kill_record_encoder(proc)
       try:
@@ -1015,6 +1058,7 @@ class GuiApplication:
     self._ffmpeg_thread = None
     self._ffmpeg_queue = None
     self._ffmpeg_stop_event = None
+    self._ffmpeg_enqueue_lock = None  # 캡처 gate가 '세션 없음'으로 반려하게 된다
     self._ffmpeg_proc = None
     return th, q, ev, proc
 
@@ -1049,17 +1093,21 @@ class GuiApplication:
     if th is None and proc is None:
       return
     self._signal_writer_stop(q, ev)
-    cleanup = threading.Thread(target=self._record_cleanup_worker, args=(th, proc), daemon=True)
     self._prune_record_cleanups()
     try:
+      # 생성자와 start() 모두 rollback 범위 — 어느 쪽이 실패해도 세션 참조는 이미
+      # 끊긴 상태라 여기서 처리하지 않으면 정리 주체가 없어진다
+      cleanup = threading.Thread(target=self._record_cleanup_worker, args=(th, proc), daemon=True)
       cleanup.start()
     except Exception:
-      # 스레드 생성 실패 — 세션 참조는 이미 끊겼으므로 여기서 처리하지 않으면
-      # 정리 주체가 없어진다. UI 1프레임 정지가 방치된 인코더보다 낫다 (동기 fallback)
+      # UI 1프레임 정지가 방치된 인코더보다 낫다 (동기 fallback). 그래도 인코더가
+      # 안 죽었으면 추적 목록에 남겨 prune/앱 종료가 kill을 재시도하게 한다
       print("[REC] cleanup thread start FAILED, tearing down synchronously")
-      self._record_teardown(th, proc)
+      if not self._record_teardown(th, proc):
+        self._record_cleanups.append([_DeadThreadMarker(), proc, time.monotonic()])
+        print("[REC] encoder cleanup incomplete, proc still alive (tracked for retry)")
       return
-    self._record_cleanups.append((cleanup, proc))  # 등록은 start 성공 후에만
+    self._record_cleanups.append([cleanup, proc, 0.0])  # 등록은 start 성공 후에만
 
   def _record_cleanup_worker(self, th, proc):
     # 이 스레드도 UI의 RT 스케줄링(FIFO53/core5)을 상속한다 — 강등이 실패하면
@@ -1074,13 +1122,31 @@ class GuiApplication:
           proc.wait(timeout=5)  # reap — 좀비 방지
         except Exception:
           pass
-      return
-    self._record_teardown(th, proc)
-    print("[REC] encoder closed")
+      resolved = self._record_proc_dead(proc)
+    else:
+      resolved = self._record_teardown(th, proc)
+    # 'closed'는 실제 종료가 확인된 경우에만 — 거짓 closed 로그는 진단을 오도한다.
+    # 미해결 인코더는 이 항목이 목록에 남아 prune/앱 종료가 kill을 재시도한다
+    if resolved:
+      print("[REC] encoder closed")
+    else:
+      print("[REC] encoder cleanup incomplete, proc still alive (tracked for retry)")
 
   @staticmethod
-  def _record_teardown(th, proc) -> None:
-    """blocking 정리 본체 — 정지 신호(_signal_writer_stop)는 이미 보낸 상태여야 한다."""
+  def _record_proc_dead(proc) -> bool:
+    """인코더 종료 확인 — 확인 불가는 보수적으로 '살아 있음'으로 본다."""
+    if proc is None:
+      return True
+    try:
+      return proc.poll() is not None
+    except Exception:
+      return False
+
+  @classmethod
+  def _record_teardown(cls, th, proc) -> bool:
+    """blocking 정리 본체 — 정지 신호(_signal_writer_stop)는 이미 보낸 상태여야 한다.
+    반환: 인코더 종료가 실제로 확인되면 True (호출자는 False면 추적을 유지해
+    kill을 재시도한다 — 'closed' 로그도 True일 때만)."""
     writer_alive = False
     try:
       if th is not None:
@@ -1102,7 +1168,7 @@ class GuiApplication:
           proc.wait(timeout=5)  # reap
         except Exception:
           pass
-        return
+        return cls._record_proc_dead(proc)
       try:
         stdin = proc.stdin
         if stdin is not None:
@@ -1148,31 +1214,31 @@ class GuiApplication:
           proc.wait(timeout=5)  # kill 후에도 reap
         except Exception:
           pass
+    return cls._record_proc_dead(proc)
+
+  # 잔존 인코더 kill 재시도 최소 간격(초) — prune은 매 프레임 불릴 수 있으므로
+  # backoff 없이는 kill이 프레임 속도로 폭주한다
+  RECORD_KILL_RETRY_INTERVAL = 1.0
 
   def _prune_record_cleanups(self) -> None:
     """해소된 정리 항목만 제거한다 — 정리 스레드가 죽어도 인코더가 살아 있으면
     (kill/reap 실패, uninterruptible child 등) 항목을 유지해 백로그 카운트가
-    거짓으로 줄지 않게 하고, 지날 때마다 kill/reap을 재시도한다. UI 스레드에서
-    불리므로 전부 논블로킹."""
+    거짓으로 줄지 않게 하고, backoff 간격으로 kill/reap을 재시도한다.
+    UI 스레드에서 불리므로 전부 논블로킹."""
+    now = time.monotonic()
     remaining = []
-    for th, proc in self._record_cleanups:
+    for item in self._record_cleanups:
+      th, proc = item[0], item[1]
       if th.is_alive():
-        remaining.append((th, proc))
+        remaining.append(item)
         continue
-      if proc is not None:
-        try:
-          proc_alive = proc.poll() is None
-        except Exception:
-          proc_alive = True  # 알 수 없으면 보수적으로 유지
-        if proc_alive:
+      if proc is not None and not self._record_proc_dead(proc):
+        if now - item[2] >= self.RECORD_KILL_RETRY_INTERVAL:
           self._kill_record_encoder(proc)
-          try:
-            proc_alive = proc.poll() is None  # kill 직후 재확인 (논블로킹 reap 시도)
-          except Exception:
-            proc_alive = True
-          if proc_alive:
-            remaining.append((th, proc))
-            continue
+          item[2] = now
+        if not self._record_proc_dead(proc):  # kill 직후 재확인 (논블로킹)
+          remaining.append(item)
+          continue
       # 스레드 종료 + 인코더 사망 확인 → 해소
     self._record_cleanups = remaining
 
@@ -1180,26 +1246,25 @@ class GuiApplication:
     """앱 종료 시 진행 중인 비동기 정리 회수. timeout 안에 못 끝난 정리는(daemon이라
     프로세스 종료와 함께 사라진다) 인코더를 직접 kill/reap해 살아있는 ffmpeg가
     남지 않게 한다 — 스레드가 끝났어도 인코더가 살아 있으면(kill/reap 실패 잔존)
-    같은 대상이다."""
+    같은 대상이다. kill 후 생존을 재확인해 '정리됐다'는 거짓 결론을 남기지 않는다."""
     deadline = time.monotonic() + timeout
-    for t, _ in self._record_cleanups:
-      t.join(timeout=max(0.0, deadline - time.monotonic()))
+    for item in self._record_cleanups:
+      item[0].join(timeout=max(0.0, deadline - time.monotonic()))
     remaining = []
-    for t, proc in self._record_cleanups:
-      proc_alive = False
-      if proc is not None:
-        try:
-          proc_alive = proc.poll() is None
-        except Exception:
-          proc_alive = True
+    for item in self._record_cleanups:
+      t, proc = item[0], item[1]
+      proc_alive = proc is not None and not self._record_proc_dead(proc)
       if proc_alive:
         self._kill_record_encoder(proc)
         try:
           proc.wait(timeout=2)
         except Exception:
           pass
-      if t.is_alive():
-        remaining.append((t, proc))
+        proc_alive = not self._record_proc_dead(proc)  # kill 후 생존 재확인
+        if proc_alive:
+          print("[REC] encoder STILL ALIVE at app close after kill")
+      if t.is_alive() or proc_alive:
+        remaining.append(item)
     self._record_cleanups = remaining
 
   def close(self):

@@ -26,8 +26,9 @@ def make_app(**over):
   app._record_fail_t = 0.0
   app._record_session_id = 0
   app._record_t0 = 0.0
-  app._record_drop_counts = dict.fromkeys(("pool_empty", "queue_full", "size_mismatch", "capture_error"), 0)
+  app._record_drop_counts = dict.fromkeys(("pool_empty", "queue_full", "size_mismatch", "capture_error", "stop_gate"), 0)
   app._ffmpeg_thread = None
+  app._ffmpeg_enqueue_lock = None
   app._ffmpeg_queue = None
   app._ffmpeg_stop_event = None
   app._ffmpeg_proc = None
@@ -161,6 +162,9 @@ class TestCaptureNoThrow:
     app._render_texture = types.SimpleNamespace(texture=object())
     app._capture_metrics = types.SimpleNamespace(end=lambda tok: None, flush=lambda: None)
     app._ffmpeg_queue = queue.Queue(maxsize=8)
+    app._ffmpeg_enqueue_lock = threading.Lock()
+    app._ffmpeg_stop_event = threading.Event()
+    app._record_failure_event = threading.Event()
     return unloads
 
   def test_success_moves_ownership_to_writer(self, monkeypatch):
@@ -238,7 +242,7 @@ class TestAsyncClose:
   def test_thread_start_failure_falls_back_to_sync(self, monkeypatch):
     app = make_app()
     torn = []
-    app._record_teardown = lambda th, proc: torn.append((th, proc))
+    app._record_teardown = lambda th, proc: bool(torn.append((th, proc))) or True
     class DeadThread:
       def __init__(self, *a, **k):
         pass
@@ -280,7 +284,7 @@ class TestWriterLifecycle:
     wq.put(pool.take())
     fev = threading.Event()
     proc = FakeProc(alive=True)
-    app._record_writer_thread(proc, wq, threading.Event(), fev, pool)
+    app._record_writer_thread(proc, wq, threading.Event(), fev, pool, threading.Lock())
     assert pool._q.qsize() == 2 and wq.empty()
     assert fev.is_set() and proc.kill_calls == 1  # fail-closed 의미 유지
 
@@ -301,7 +305,7 @@ class TestWriterLifecycle:
     old_q.put(old_pool.take())
     old_q.put(None)
     old_fev = threading.Event()
-    app._record_writer_thread(old_proc, old_q, threading.Event(), old_fev, old_pool)
+    app._record_writer_thread(old_proc, old_q, threading.Event(), old_fev, old_pool, threading.Lock())
     assert len(writes) == 1 and old_pool._q.qsize() == 1  # 자기 세션 풀로만 반환
     assert new_pool._q.qsize() == 1 and app._ffmpeg_queue.empty()  # 새 세션 불가침
 
@@ -322,7 +326,8 @@ class TestWriterLifecycle:
     assert ok is False
     assert fp.kill_calls == 1 and fp.wait_calls  # 인코더 rollback: kill + reap
     assert (app._ffmpeg_proc is None and app._ffmpeg_queue is None
-            and app._ffmpeg_thread is None and app._ffmpeg_stop_event is None)
+            and app._ffmpeg_thread is None and app._ffmpeg_stop_event is None
+            and app._ffmpeg_enqueue_lock is None)
 
 
 class TestTeardownWriterAlive:
@@ -345,7 +350,7 @@ class TestPruneCleanups:
     app = make_app()
     dead = types.SimpleNamespace(is_alive=lambda: False)
     stubborn = FakeProc(alive=True, dies_on_kill=False)
-    app._record_cleanups = [(dead, stubborn)]
+    app._record_cleanups = [[dead, stubborn, 0.0]]
     app._prune_record_cleanups()
     assert len(app._record_cleanups) == 1 and stubborn.kill_calls == 1
 
@@ -353,14 +358,14 @@ class TestPruneCleanups:
     app = make_app()
     dead = types.SimpleNamespace(is_alive=lambda: False)
     proc = FakeProc(alive=True, dies_on_kill=True)
-    app._record_cleanups = [(dead, proc)]
+    app._record_cleanups = [[dead, proc, 0.0]]
     app._prune_record_cleanups()
     assert app._record_cleanups == [] and proc.kill_calls == 1  # kill로 해소
 
   def test_dead_thread_dead_proc_removed(self):
     app = make_app()
     dead = types.SimpleNamespace(is_alive=lambda: False)
-    app._record_cleanups = [(dead, FakeProc(alive=False))]
+    app._record_cleanups = [[dead, FakeProc(alive=False), 0.0]]
     app._prune_record_cleanups()
     assert app._record_cleanups == []
 
@@ -368,7 +373,7 @@ class TestPruneCleanups:
     app = make_app()
     alive = types.SimpleNamespace(is_alive=lambda: True)
     proc = FakeProc(alive=True)
-    app._record_cleanups = [(alive, proc)]
+    app._record_cleanups = [[alive, proc, 0.0]]
     app._prune_record_cleanups()
     assert len(app._record_cleanups) == 1 and proc.kill_calls == 0  # 진행 중 정리는 존중
 
@@ -378,7 +383,7 @@ class TestJoinCleanups:
     app = make_app()
     proc = FakeProc(alive=True)
     stuck = types.SimpleNamespace(join=lambda timeout=None: None, is_alive=lambda: True)
-    app._record_cleanups = [(stuck, proc)]
+    app._record_cleanups = [[stuck, proc, 0.0]]
     app._join_record_cleanups(timeout=0.1)
     assert proc.kill_calls == 1 and len(proc.wait_calls) == 1  # 살아있는 ffmpeg 금지
 
@@ -387,7 +392,7 @@ class TestJoinCleanups:
     app = make_app()
     proc = FakeProc(alive=True)
     dead = types.SimpleNamespace(join=lambda timeout=None: None, is_alive=lambda: False)
-    app._record_cleanups = [(dead, proc)]
+    app._record_cleanups = [[dead, proc, 0.0]]
     app._join_record_cleanups(timeout=0.1)
     assert proc.kill_calls == 1 and app._record_cleanups == []
 
@@ -396,7 +401,7 @@ class TestDeferredStartContract:
   def test_backlog_defers_with_pending_and_single_log(self, monkeypatch, capsys):
     app = make_app()
     alive = types.SimpleNamespace(is_alive=lambda: True)
-    app._record_cleanups = [(alive, None), (alive, None)]
+    app._record_cleanups = [[alive, None, 0.0], [alive, None, 0.0]]
     ensured = []
     app._ensure_render_texture_for_recording = lambda: ensured.append(1)
     app.start_recording()
@@ -423,7 +428,7 @@ class TestDeferredStartContract:
     # 백로그가 해소되면(스레드 종료+인코더 사망) pending이 풀리고 시작 로직이 진행된다
     app = make_app()
     dead = types.SimpleNamespace(is_alive=lambda: False)
-    app._record_cleanups = [(dead, FakeProc(alive=False)), (dead, FakeProc(alive=False))]
+    app._record_cleanups = [[dead, FakeProc(alive=False), 0.0], [dead, FakeProc(alive=False), 0.0]]
     app._record_start_pending = True
     ensured = []
     app._ensure_render_texture_for_recording = lambda: ensured.append(1)
@@ -445,6 +450,9 @@ class TestDropCounters:
     app._render_texture = types.SimpleNamespace(texture=object())
     app._capture_metrics = types.SimpleNamespace(end=lambda tok: None, flush=lambda: None)
     app._ffmpeg_queue = queue.Queue(maxsize=8)
+    app._ffmpeg_enqueue_lock = threading.Lock()
+    app._ffmpeg_stop_event = threading.Event()
+    app._record_failure_event = threading.Event()
 
   def test_each_drop_path_counted(self, monkeypatch):
     app = make_app()
@@ -481,7 +489,7 @@ class TestDropCounters:
     app._close_ffmpeg_async = lambda: None
     app.stop_recording()
     out = capsys.readouterr().out
-    assert "session drops: pool_empty=0 queue_full=0 size_mismatch=0 capture_error=0" in out
+    assert "session drops: pool_empty=0 queue_full=0 size_mismatch=0 capture_error=0 stop_gate=0" in out
 
   def test_start_resets_counters_per_session(self):
     app = make_app()
@@ -514,3 +522,159 @@ class TestMainLayoutSync:
       params=types.SimpleNamespace(put_bool_nonblocking=lambda k, v: puts.append((k, v)))))
     mici_main.MiciMainLayout._sync_screen_record_state(True)
     assert puts == [("ScreenRecord", False)]  # 실패는 기존대로 사용자에게 드러난다
+
+
+class TestEnqueueGate:
+  """writer terminal drain과 UI의 늦은 enqueue 사이 race — 소유권 소실 금지."""
+
+  def _wire_capture(self, monkeypatch, app):
+    monkeypatch.setattr(app_mod, "rl", types.SimpleNamespace(
+      load_image_from_texture=lambda tex: types.SimpleNamespace(width=2, height=2, data=bytes(16)),
+      unload_image=lambda img: None,
+      ffi=types.SimpleNamespace(memmove=lambda dest, src, n: dest.__setitem__(slice(0, n), src[:n])),
+    ))
+    app._render_texture = types.SimpleNamespace(texture=object())
+    app._capture_metrics = types.SimpleNamespace(end=lambda tok: None, flush=lambda: None)
+    app._ffmpeg_queue = queue.Queue(maxsize=8)
+    app._ffmpeg_enqueue_lock = threading.Lock()
+    app._ffmpeg_stop_event = threading.Event()
+    app._record_failure_event = threading.Event()
+
+  def test_late_enqueue_after_failure_is_gated(self, monkeypatch):
+    # writer-first: failure(+stop) set + drain 완료 후의 캡처는 큐에 넣지 않고
+    # 반려 — 소유자 없는 버퍼가 생기지 않고 stop_gate로 관측된다
+    app = make_app()
+    app._ensure_record_buf_pool(16)
+    self._wire_capture(monkeypatch, app)
+    app._record_failure_event.set()
+    app._ffmpeg_stop_event.set()
+    app._capture_record_frame()
+    assert app._ffmpeg_queue.empty()
+    assert app._record_buf_pool._q.qsize() == app._record_buf_count  # buf 회수
+    assert app._record_drop_counts["stop_gate"] == 1
+
+  def test_producer_first_buffer_recovered_by_terminal_drain(self, monkeypatch):
+    # producer-first: gate 통과 시점에 Event 미설정이라 put됐다면, 이후 writer의
+    # terminal drain(락 아래)이 그 버퍼를 회수한다
+    app = make_app()
+    app._ensure_record_buf_pool(16)
+    self._wire_capture(monkeypatch, app)
+    app._capture_record_frame()  # 정상 enqueue
+    assert app._ffmpeg_queue.qsize() == 1
+    app._demote_record_sched = lambda: False  # writer 즉시 비정상 종료 경로
+    fev = app._record_failure_event
+    app._record_writer_thread(FakeProc(alive=True), app._ffmpeg_queue, app._ffmpeg_stop_event,
+                              fev, app._record_buf_pool, app._ffmpeg_enqueue_lock)
+    assert app._record_buf_pool._q.qsize() == app._record_buf_count  # drain이 회수
+    assert fev.is_set() and app._ffmpeg_stop_event.is_set()  # failure 시 stop도 set
+
+  def test_detached_session_gates_capture(self, monkeypatch):
+    # detach 후(락 None) 캡처는 반려 — 세션 없는 큐 접근 자체가 없다
+    app = make_app()
+    app._ensure_record_buf_pool(16)
+    self._wire_capture(monkeypatch, app)
+    app._ffmpeg_enqueue_lock = None
+    app._capture_record_frame()
+    assert app._record_drop_counts["stop_gate"] == 1
+    assert app._record_buf_pool._q.qsize() == app._record_buf_count
+
+
+class TestCleanupConstructorFailure:
+  def test_constructor_failure_falls_back_to_sync(self, monkeypatch):
+    # Thread(...) 생성자 자체의 예외도 rollback 범위 — 정리 주체가 사라지면 안 된다
+    app = make_app()
+    torn = []
+    app._record_teardown = lambda th, proc: bool(torn.append((th, proc))) or True
+    class BadCtor:
+      def __init__(self, *a, **k):
+        raise RuntimeError("ctor fail")
+    monkeypatch.setattr(app_mod.threading, "Thread", BadCtor)
+    ev = threading.Event()
+    app._ffmpeg_thread, app._ffmpeg_queue = object(), queue.Queue()
+    app._ffmpeg_stop_event, app._ffmpeg_proc = ev, "proc"
+    app._close_ffmpeg_async()  # 예외 무전파
+    assert torn == [(app._ffmpeg_thread, "proc")] or torn  # 동기 fallback 실행
+    assert ev.is_set() and app._record_cleanups == []
+
+  def test_unresolved_sync_fallback_is_tracked(self, monkeypatch):
+    # 동기 fallback조차 인코더를 못 죽였으면(unresolved) 추적 목록에 남아
+    # prune/앱 종료가 kill을 재시도한다
+    app = make_app()
+    app._record_teardown = lambda th, proc: False  # 미해소
+    class BadCtor:
+      def __init__(self, *a, **k):
+        raise RuntimeError("ctor fail")
+    monkeypatch.setattr(app_mod.threading, "Thread", BadCtor)
+    stubborn = FakeProc(alive=True, dies_on_kill=False)
+    app._ffmpeg_thread, app._ffmpeg_queue = object(), queue.Queue()
+    app._ffmpeg_stop_event, app._ffmpeg_proc = threading.Event(), stubborn
+    app._close_ffmpeg_async()
+    assert len(app._record_cleanups) == 1 and app._record_cleanups[0][1] is stubborn
+    assert not app._record_cleanups[0][0].is_alive()  # 마커 — prune이 proc 기준으로 처리
+
+
+class TestKillRetryRateLimit:
+  def test_prune_rekill_is_rate_limited(self, monkeypatch):
+    # prune은 매 프레임 불릴 수 있다 — 잔존 인코더 kill이 프레임 속도로 폭주하면 안 된다
+    app = make_app()
+    dead = types.SimpleNamespace(is_alive=lambda: False)
+    stubborn = FakeProc(alive=True, dies_on_kill=False)
+    app._record_cleanups = [[dead, stubborn, 0.0]]
+    now = {"t": 1000.0}
+    monkeypatch.setattr(app_mod.time, "monotonic", lambda: now["t"])
+    app._prune_record_cleanups()
+    app._prune_record_cleanups()  # 같은 시각 — backoff로 재kill 없음
+    assert stubborn.kill_calls == 1
+    now["t"] += GuiApplication.RECORD_KILL_RETRY_INTERVAL + 0.1
+    app._prune_record_cleanups()
+    assert stubborn.kill_calls == 2  # 간격 경과 후 재시도
+
+
+class TestEncoderClosedTruth:
+  def test_no_false_closed_log(self, capsys):
+    # 'encoder closed'는 실제 종료 확인 후에만 — 거짓 로그는 진단을 오도한다
+    app = make_app()
+    app._demote_record_sched = lambda: True
+    app._record_teardown = lambda th, proc: False  # 미해소
+    app._record_cleanup_worker(None, FakeProc(alive=True, dies_on_kill=False))
+    out = capsys.readouterr().out
+    assert "encoder closed" not in out and "cleanup incomplete" in out
+
+  def test_closed_logged_when_confirmed(self, capsys):
+    app = make_app()
+    app._demote_record_sched = lambda: True
+    app._record_teardown = lambda th, proc: True
+    app._record_cleanup_worker(None, FakeProc(alive=False))
+    assert "encoder closed" in capsys.readouterr().out
+
+  def test_demotion_failure_path_also_truthful(self, capsys):
+    app = make_app()
+    app._demote_record_sched = lambda: False
+    app._record_cleanup_worker(None, FakeProc(alive=True, dies_on_kill=False))  # kill 불응
+    out = capsys.readouterr().out
+    assert "encoder closed" not in out and "cleanup incomplete" in out
+
+
+class TestAppCloseLiveness:
+  def test_still_alive_after_kill_is_reported_and_kept(self, capsys):
+    # 앱 종료 kill 후에도 살아 있으면 거짓 '정리 완료'를 남기지 않는다
+    app = make_app()
+    stubborn = FakeProc(alive=True, dies_on_kill=False)
+    dead = types.SimpleNamespace(join=lambda timeout=None: None, is_alive=lambda: False)
+    app._record_cleanups = [[dead, stubborn, 0.0]]
+    app._join_record_cleanups(timeout=0.1)
+    assert "STILL ALIVE" in capsys.readouterr().out
+    assert len(app._record_cleanups) == 1  # 추적 유지
+
+
+class TestFailCountPolicy:
+  def test_init_failure_counts_toward_cooldown(self):
+    # launch/writer-start 실패도 연속 실패 쿨다운 정책에 포함 (문서-동작 일치)
+    app = make_app()
+    app._render_texture = types.SimpleNamespace(texture=types.SimpleNamespace(width=2, height=2))
+    app._ensure_render_texture_for_recording = lambda: None
+    app._new_record_path = lambda: "/tmp/x.mp4"
+    app._init_ffmpeg = lambda path: False
+    app.start_recording()
+    assert app._record_fail_count == 1 and app._record_fail_t > 0
+    assert not app._record_enabled
