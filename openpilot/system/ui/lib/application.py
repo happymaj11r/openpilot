@@ -21,7 +21,6 @@ from importlib.resources import as_file
 from openpilot.common.basedir import BASEDIR
 from openpilot.common.swaglog import cloudlog
 from openpilot.system.ui.lib.carrot_render_metrics import SectionMetrics
-from openpilot.system.ui.lib import carrot_pbo_readback
 from openpilot.system.hardware import HARDWARE, PC
 from openpilot.system.ui.lib.multilang import multilang
 from openpilot.common.realtime import Ratekeeper
@@ -376,17 +375,10 @@ class GuiApplication:
     # 라이터 스레드의 비정상 종료 신호 — 인코더 프로세스가 살아 있어도(예: kill 실패,
     # stdin write 예외) 렌더 루프가 실패를 감지할 수 있게 한다. 세션마다 새 객체로 교체.
     self._record_failure_event = threading.Event()
-    # 캡처(GPU readback+복사) 구간의 wall/cpu 분리 계측 (route 418 진단).
+    # 캡처(동기 GPU readback) 구간의 wall/cpu 분리 계측 (route 418 진단).
     # 캡처는 3프레임당 1회뿐이라 window 50 ≈ 13fps 기준 11.6초 — 30초 진단
     # 구간에서도 집계가 나온다 (200이면 46초가 필요해 로그 0줄 가능)
     self._capture_metrics = SectionMetrics("screenCapture", window=50)
-    # 비동기 readback(더블 버퍼 PBO) — 동기 readback의 GPU 완료 대기(route
-    # 0000041f: wall p95 25.1ms/max 74.0ms, C FPS 15.7)를 없앤다. 텍스처 크기
-    # 세대로 관리(풀과 동일)하고, GL 미지원/오류면 프로세스 영구 sync 폴백
-    # (모드 전환은 [REC] capture readback 로그 1회로 관측)
-    self._record_pbo: carrot_pbo_readback.PboReadback | None = None
-    self._record_pbo_disabled = False
-    self._record_pbo_logged = False
     # 녹화 세션 카운터 — 60초 회전은 같은 프레임에 stop→start라 recording bool만으로는
     # 계측 phase가 구분되지 않는다. 시작 성공마다 증가시켜 회전 전후를 분리한다
     self._record_session_id = 0
@@ -456,11 +448,6 @@ class GuiApplication:
       return
     tex = self._render_texture.texture
     self._ensure_record_buf_pool(tex.width * tex.height * 4)
-    if self._record_pbo is not None:
-      # 이전 세션의 잔여 PBO 프레임 폐기 — stop 후 한참 뒤 재시작하면 오래된
-      # 화면이 새 파일의 첫 프레임으로 들어간다 (60초 회전도 동일 규칙: 세션마다
-      # 첫 캡처는 프라이밍, 표본 수 = 산출 프레임 수)
-      self._record_pbo.reset()
 
     out_path = self._new_record_path()
     if not self._init_ffmpeg(out_path):
@@ -528,56 +515,12 @@ class GuiApplication:
     if pool is None or pool.buf_size != data_size:
       self._record_buf_pool = _RecordBufPool(data_size, self._record_buf_count)
 
-  def _ensure_record_pbo(self, data_size: int):
-    """비동기 readback 준비 — 같은 크기면 프로세스 수명 재사용(풀과 동일), 크기가
-    바뀌면 GL 버퍼를 반납하고 새로 만든다(캡처=렌더 스레드라 GL 호출 안전).
-    생성 실패는 영구 sync 폴백으로 확정 — 매 캡처 재시도로 GL 오류를 반복
-    유발하지 않는다. 반환 None = 동기 경로."""
-    if self._record_pbo_disabled:
-      return None
-    pbo = self._record_pbo
-    if pbo is not None and pbo.ok and pbo.data_size == data_size:
-      return pbo
-    if pbo is not None:
-      pbo.release()
-      self._record_pbo = None
-    # issue의 READ framebuffer 바인딩은 rlgl로 한다 — 구버전 바인딩에 함수가
-    # 없으면 PBO 경로 자체를 쓰지 않는다 (캡처마다 AttributeError 내지 않게)
-    if not (hasattr(rl, "rl_enable_framebuffer") and hasattr(rl, "rl_disable_framebuffer")):
-      self._disable_record_pbo("rlgl framebuffer api unavailable")
-      return None
-    pbo = carrot_pbo_readback.create(data_size)
-    if pbo is None:
-      self._disable_record_pbo("pbo unavailable")
-      return None
-    self._record_pbo = pbo
-    if not self._record_pbo_logged:
-      self._record_pbo_logged = True
-      print("[REC] capture readback: async-pbo")
-    return pbo
-
-  def _disable_record_pbo(self, why: str) -> None:
-    """PBO 경로 프로세스 영구 차단 + 동기 폴백 선언 — 전환 로그는 1회만
-    (tmux.log에서 실제 동작 모드를 판별하는 관측점)."""
-    if self._record_pbo_disabled:
-      return
-    self._record_pbo_disabled = True
-    pbo, self._record_pbo = self._record_pbo, None
-    if pbo is not None:
-      pbo.release()
-    self._record_pbo_logged = True  # 이후 async 로그 억제 (재시도 없음)
-    print(f"[REC] capture readback: sync fallback ({why})")
-
   def _capture_record_frame(self) -> None:
     """carrot 녹화 캡처: GPU readback을 재사용 버퍼로 복사해 인코더 큐에 넘긴다.
 
-    readback은 비동기 PBO가 기본 — 이번 프레임은 DMA 시작(issue)만 걸고 '직전
-    캡처' 프레임을 map해 가져오므로 GPU 완료를 기다리는 stall이 없다 (route
-    0000041f: 동기 readback의 wall p95 25.1ms/max 74.0ms가 C FPS 15.7의 주원인).
-    산출 프레임은 1캡처 지연(균일 시프트)이고, 세션 첫 캡처는 프라이밍이라
-    프레임을 내지 않는다 — 드랍 카운트 아님(그 프레임은 PBO에 있고 다음 캡처가
-    배출). GL 미지원/오류면 같은 프레임에서 기존 동기 readback으로 폴백한다
-    (프로세스 영구, [REC] 로그 1회).
+    동기 readback 유지는 의도된 결정(2026-07-14): ScreenRecord는 희귀 진단
+    기능이라 녹화 중 UI FPS(~15-16, soft gate)보다 단순성·GL 호환성이 우선이다
+    — async PBO는 b17e48a7fa에서 시도 후 제거했다 (재도입에는 실측 근거 필요).
 
     기존 bytes(ffi.buffer(...)) 방식은 캡처마다 ~9MB Python bytes 생성/GC로
     capture cpu p50 7.5ms의 주성분이었다(route 41d) — ffi.memmove로 재사용
@@ -594,72 +537,39 @@ class GuiApplication:
       return  # 풀 고갈 — readback 비용도 아끼며 프레임 드랍
     image = None
     try:
-      pbo = self._ensure_record_pbo(len(buf))  # 1회성 생성 비용은 계측 밖
       # readback+복사+해제까지만 계측 — 큐 비용은 캡처 비용이 아니므로 제외
       cap_tok = SectionMetrics.begin()
-      frame_ready = False
-      mismatch = False
-      if pbo is not None:
-        tex = self._render_texture.texture
-        if tex.width * tex.height * 4 != len(buf):
-          mismatch = True  # 텍스처 재생성 등 — 세대 불일치는 sync로 가도 같으니 드랍
+      image = rl.load_image_from_texture(self._render_texture.texture)
+      if image.width * image.height * 4 == len(buf):
+        rl.ffi.memmove(buf, image.data, len(buf))
+        rl.unload_image(image)
+        image = None
+        self._capture_metrics.end(cap_tok)
+        # enqueue gate: writer의 terminal drain과 락으로 직렬화 — writer가 비정상
+        # 종료해 큐를 비운 '뒤'에 넣는 버퍼는 소유자가 없어 영구 소실되므로,
+        # stop/failure가 표시된 세션에는 넣지 않고 반려한다 (buf는 finally가 회수).
+        # UI는 try-lock — SCHED_OTHER인 writer가 락을 쥔 채 선점당해도 UI 프레임이
+        # 상한 없이 기다리지 않는다 (획득 실패 = 이번 프레임 드랍, gate_busy로 관측)
+        lock = self._ffmpeg_enqueue_lock
+        stop_ev = self._ffmpeg_stop_event
+        if lock is None:
+          counts["stop_gate"] += 1  # 세션 경계(detach 후) — 반려
+        elif not lock.acquire(blocking=False):
+          counts["gate_busy"] += 1
         else:
-          frame_ready = pbo.retrieve_into(buf)  # 직전 캡처 프레임 (첫 캡처는 False)
-          rlgl_ok = True
           try:
-            try:
-              rl.rl_enable_framebuffer(self._render_texture.id)
-              pbo.issue(tex.width, tex.height)
-            finally:
-              # enable 자체의 예외 포함 어떤 경로든 기본 framebuffer 복원 —
-              # rt FBO가 바인드된 채 벗어나면 다음 프레임이 화면 대신 rt에
-              # 그려진다 (enable 미실행이었으면 0→0 재바인드라 무해)
-              rl.rl_disable_framebuffer()
-          except Exception:
-            rlgl_ok = False  # rlgl 계층 실패 — PBO GL 오류와 동일하게 폴백
-          if not rlgl_ok or not pbo.ok:
-            # GL 오류 — retrieve 내용도 신뢰하지 않고 이번 프레임을 sync로 다시 뜬다
-            self._disable_record_pbo("gl error")
-            pbo = None
-            frame_ready = False
-      if pbo is None and not mismatch:
-        image = rl.load_image_from_texture(self._render_texture.texture)
-        if image.width * image.height * 4 == len(buf):
-          rl.ffi.memmove(buf, image.data, len(buf))
-          rl.unload_image(image)
-          image = None
-          frame_ready = True
-        else:
-          mismatch = True
-      if mismatch:
-        counts["size_mismatch"] += 1  # 샘플/프레임 드랍, finally가 회수
-        return
-      if not frame_ready:
-        return  # PBO 프라이밍 — 계측 표본 없음(표본 수 = 산출 프레임 수 유지)
-      self._capture_metrics.end(cap_tok)
-      # enqueue gate: writer의 terminal drain과 락으로 직렬화 — writer가 비정상
-      # 종료해 큐를 비운 '뒤'에 넣는 버퍼는 소유자가 없어 영구 소실되므로,
-      # stop/failure가 표시된 세션에는 넣지 않고 반려한다 (buf는 finally가 회수).
-      # UI는 try-lock — SCHED_OTHER인 writer가 락을 쥔 채 선점당해도 UI 프레임이
-      # 상한 없이 기다리지 않는다 (획득 실패 = 이번 프레임 드랍, gate_busy로 관측)
-      lock = self._ffmpeg_enqueue_lock
-      stop_ev = self._ffmpeg_stop_event
-      if lock is None:
-        counts["stop_gate"] += 1  # 세션 경계(detach 후) — 반려
-      elif not lock.acquire(blocking=False):
-        counts["gate_busy"] += 1
+            if (stop_ev is not None and stop_ev.is_set()) or self._record_failure_event.is_set():
+              counts["stop_gate"] += 1
+            else:
+              try:
+                self._ffmpeg_queue.put_nowait(buf)
+                buf = None  # 소유권 이동 — writer가 반환
+              except queue.Full:
+                counts["queue_full"] += 1
+          finally:
+            lock.release()
       else:
-        try:
-          if (stop_ev is not None and stop_ev.is_set()) or self._record_failure_event.is_set():
-            counts["stop_gate"] += 1
-          else:
-            try:
-              self._ffmpeg_queue.put_nowait(buf)
-              buf = None  # 소유권 이동 — writer가 반환
-            except queue.Full:
-              counts["queue_full"] += 1
-        finally:
-          lock.release()
+        counts["size_mismatch"] += 1  # 텍스처 재생성 등 — 샘플/프레임 드랍, finally가 회수
     except Exception:
       counts["capture_error"] += 1  # readback/복사/세션 경계 실패 — 프레임 드랍
     finally:

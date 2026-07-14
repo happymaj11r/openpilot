@@ -13,10 +13,7 @@ import subprocess
 import threading
 import types
 
-import cffi
-
 import openpilot.system.ui.lib.application as app_mod
-from openpilot.system.ui.lib import carrot_pbo_readback as pbo_mod
 from openpilot.system.ui.lib.application import GuiApplication, _RecordBufPool, _record_stdin_write_all
 
 
@@ -39,11 +36,6 @@ def make_app(**over):
   app._ffmpeg_queue = None
   app._ffmpeg_stop_event = None
   app._ffmpeg_proc = None
-  # PBO는 기본 차단 — 기존 캡처 테스트는 동기 readback 경로를 그대로 검증한다
-  # (비동기 경로는 TestCaptureAsyncPbo가 명시적으로 켠다)
-  app._record_pbo = None
-  app._record_pbo_disabled = True
-  app._record_pbo_logged = True
   for k, v in over.items():
     setattr(app, k, v)
   return app
@@ -325,348 +317,26 @@ class TestCaptureNoThrow:
     assert app._record_buf_pool._q.qsize() == app._record_buf_count
 
 
-class _FakeGL:
-  """PboReadback의 GL 계약을 고정하는 가짜 — 실제 cffi cdata(GLuint[2], NULL,
-  from_buffer 포인터)와 상호작용해 바인딩 계층까지 함께 검증한다.
-  주입 플래그로 각 GL 단계의 예외/실패를 모사한다 (예외 경로의 unmap/unbind
-  보장이 리뷰 blocker였다)."""
+class TestSyncReadbackOnly:
+  # async PBO readback은 시도(b17e48a7fa) 후 제거됐다 — ScreenRecord는 희귀 진단
+  # 기능이라 녹화 중 UI FPS(soft gate)보다 단순성·GL 호환성이 우선(2026-07-14
+  # 결정). 동기 readback + 풀 8 + 비동기 encoder lifecycle이 기준선이다.
+  def test_pbo_helpers_removed(self):
+    assert not hasattr(GuiApplication, "_ensure_record_pbo")
+    assert not hasattr(GuiApplication, "_disable_record_pbo")
 
-  def __init__(self, ffi, map_null=False, unmap_result=1, unmap_raises=False,
-               bufferdata_raises=False, readpixels_raises=False):
-    self.ffi = ffi
-    self.map_null = map_null
-    self.unmap_result = unmap_result
-    self.unmap_raises = unmap_raises
-    self.bufferdata_raises = bufferdata_raises
-    self.readpixels_raises = readpixels_raises
-    self.stores: dict[int, bytearray] = {}  # PBO id → 저장소
-    self.bound = 0
-    self.fb = b""            # glReadPixels가 읽을 '현재 framebuffer' 픽셀
-    self.errors: list[int] = []  # glGetError가 순서대로 돌려줄 주입 오류
-    self.bind_history: list[int] = []
-    self.deleted: list[int] = []
-    self.unmap_calls = 0
-    self._next_id = 1
-    self._last_map = None    # from_buffer cdata 수명 유지
-
-  def glGetError(self):
-    return self.errors.pop(0) if self.errors else 0
-
-  def glGenBuffers(self, n, out):
-    for i in range(n):
-      out[i] = self._next_id
-      self._next_id += 1
-
-  def glDeleteBuffers(self, n, ids):
-    for i in range(n):
-      self.deleted.append(ids[i])
-      self.stores.pop(ids[i], None)
-
-  def glBindBuffer(self, target, buf):
-    self.bound = buf
-    self.bind_history.append(buf)
-
-  def glBufferData(self, target, size, data, usage):
-    if self.bufferdata_raises:
-      raise RuntimeError("alloc failed")
-    if self.bound:
-      self.stores[self.bound] = bytearray(int(size))
-
-  def glReadPixels(self, x, y, w, h, fmt, typ, ptr):
-    if self.readpixels_raises:
-      raise RuntimeError("read failed")
-    if self.bound and self.bound in self.stores:
-      self.stores[self.bound][:] = self.fb  # DMA 완료를 즉시로 모사
-
-  def glMapBufferRange(self, target, off, length, access):
-    if self.map_null or not self.bound:
-      return self.ffi.NULL
-    self._last_map = self.ffi.from_buffer(self.stores[self.bound])
-    return self._last_map
-
-  def glUnmapBuffer(self, target):
-    self.unmap_calls += 1
-    if self.unmap_raises:
-      raise RuntimeError("unmap failed")
-    return self.unmap_result
-
-
-def make_pbo(size=16, **gl_kwargs):
-  ffi = cffi.FFI()
-  ffi.cdef(pbo_mod._GL_CDEF)
-  gl = _FakeGL(ffi, **gl_kwargs)
-  return pbo_mod.PboReadback(ffi, gl, size), gl
-
-
-class TestPboReadback:
-  # 더블 버퍼 PBO 상태기계 계약: 1캡처 지연 파이프라인, no-throw, 오류 시
-  # ok=False 수렴(호출자가 동기 폴백)
-
-  def test_create_none_without_gl(self, monkeypatch):
-    monkeypatch.setattr(pbo_mod, "_load_gl", lambda: (None, None))
-    assert pbo_mod.create(16) is None
-
-  def test_init_gl_error_not_ok_and_released(self):
-    ffi = cffi.FFI()
-    ffi.cdef(pbo_mod._GL_CDEF)
-    gl = _FakeGL(ffi)
-    gl.errors = [0, 0x0502]  # drain은 통과(0), 할당 검증에서 오류
-    pbo = pbo_mod.PboReadback(ffi, gl, 16)
-    assert pbo.ok is False and sorted(gl.deleted) == [1, 2]
-
-  def test_pipeline_delivers_previous_frame(self):
-    # issue k의 프레임은 retrieve k+1이 가져간다 — PBO 두 개가 교대로 쓰인다
-    pbo, gl = make_pbo(16)
-    assert pbo.ok
-    gl.fb = b"A" * 16
-    assert pbo.issue(2, 2) is True
-    gl.fb = b"B" * 16
-    buf = bytearray(16)
-    assert pbo.retrieve_into(buf) is True and bytes(buf) == b"A" * 16
-    assert pbo.issue(2, 2) is True
-    gl.fb = b"C" * 16
-    assert pbo.retrieve_into(buf) is True and bytes(buf) == b"B" * 16
-    used = {b for b in gl.bind_history if b != 0}
-    assert used == {1, 2}  # 교대 사용 — 한 PBO에 몰리면 매 캡처 stall이 재발한다
-
-  def test_retrieve_without_pending_is_priming(self):
-    pbo, _gl = make_pbo(16)
-    assert pbo.retrieve_into(bytearray(16)) is False and pbo.ok is True
-
-  def test_reset_discards_pending(self):
-    # 세션 경계의 잔여 프레임 폐기 — 오래된 화면이 새 파일 첫 프레임이 되면 안 된다
-    pbo, gl = make_pbo(16)
-    gl.fb = b"O" * 16
-    pbo.issue(2, 2)
-    pbo.reset()
-    assert pbo.retrieve_into(bytearray(16)) is False and pbo.ok is True
-
-  def test_issue_gl_error_disables(self):
-    pbo, gl = make_pbo(16)
-    gl.errors = [0x0505]  # issue 검증에서 오류
-    assert pbo.issue(2, 2) is False and pbo.ok is False
-    assert pbo.retrieve_into(bytearray(16)) is False  # 이후 전부 no-op
-
-  def test_map_null_disables(self):
-    pbo, gl = make_pbo(16, map_null=True)
-    gl.fb = b"A" * 16
-    pbo.issue(2, 2)
-    assert pbo.retrieve_into(bytearray(16)) is False and pbo.ok is False
-
-  def test_release_deletes_buffers_and_disables(self):
-    pbo, gl = make_pbo(16)
-    pbo.release()
-    assert sorted(gl.deleted) == [1, 2] and pbo.ok is False
-    pbo.release()  # 이중 호출 안전 (ids는 이미 None)
-    assert sorted(gl.deleted) == [1, 2]
-
-  # --- 예외 주입: 어떤 단계가 실패해도 unmap/unbind/release가 보장돼야 한다
-  # (PACK_BUFFER 바인딩이 남으면 동기 폴백의 readback까지 PBO 오프셋으로 오염)
-
-  def test_bufferdata_exception_unbinds_and_releases(self):
-    ffi = cffi.FFI()
-    ffi.cdef(pbo_mod._GL_CDEF)
-    gl = _FakeGL(ffi, bufferdata_raises=True)
-    pbo = pbo_mod.PboReadback(ffi, gl, 16)
-    assert pbo.ok is False
-    assert gl.bind_history[-1] == 0        # 부분 초기화 예외에도 바인딩 복원
-    assert sorted(gl.deleted) == [1, 2]    # 생성된 PBO 반납 — 세대 교체 누수 금지
-
-  def test_readpixels_exception_unbinds(self):
-    pbo, gl = make_pbo(16)
-    gl.readpixels_raises = True
-    assert pbo.issue(2, 2) is False and pbo.ok is False
-    assert gl.bind_history[-1] == 0
-
-  def test_unmap_false_rejects_frame_and_disables(self):
-    # GL_FALSE = 전송 중 저장소 손상 — map으로 복사한 내용은 undefined이므로
-    # 프레임을 성공 처리하면 깨진 프레임이 인코더로 들어간다
-    pbo, gl = make_pbo(16)
-    gl.fb = b"A" * 16
-    pbo.issue(2, 2)
-    gl.unmap_result = 0
-    assert pbo.retrieve_into(bytearray(16)) is False and pbo.ok is False
-    assert gl.unmap_calls == 1 and gl.bind_history[-1] == 0
-
-  def test_unmap_exception_still_unbinds(self):
-    pbo, gl = make_pbo(16)
-    gl.fb = b"A" * 16
-    pbo.issue(2, 2)
-    gl.unmap_raises = True
-    assert pbo.retrieve_into(bytearray(16)) is False and pbo.ok is False
-    assert gl.unmap_calls == 2             # finally 실패 후 except에서 재시도
-    assert gl.bind_history[-1] == 0        # _safe_unbind가 복원
-
-  def test_memmove_exception_unmaps_and_unbinds(self):
-    ffi = cffi.FFI()
-    ffi.cdef(pbo_mod._GL_CDEF)
-    gl = _FakeGL(ffi)
-
-    class _RaisingMemmoveFfi:
-      NULL = ffi.NULL
-      new = staticmethod(ffi.new)
-      cast = staticmethod(ffi.cast)
-      @staticmethod
-      def memmove(*_a):
-        raise RuntimeError("copy failed")
-
-    pbo = pbo_mod.PboReadback(_RaisingMemmoveFfi, gl, 16)
-    assert pbo.ok
-    gl.fb = b"A" * 16
-    pbo.issue(2, 2)
-    assert pbo.retrieve_into(bytearray(16)) is False and pbo.ok is False
-    assert gl.unmap_calls == 1             # map된 채 방치 금지 — finally가 unmap
-    assert gl.bind_history[-1] == 0
-
-
-class _FakeAppPbo:
-  """application 쪽 PBO 사용 계약을 고정하는 duck-type — frames가 비면 프라이밍."""
-
-  def __init__(self, size, frames=(), fail_issue=False):
-    self.data_size = size
-    self.ok = True
-    self.frames = [bytes(f) for f in frames]
-    self.issued = 0
-    self.released = False
-    self.reset_calls = 0
-    self._fail_issue = fail_issue
-
-  def retrieve_into(self, dst):
-    if not self.frames:
-      return False
-    dst[:] = self.frames.pop(0)
-    return True
-
-  def issue(self, w, h):
-    self.issued += 1
-    if self._fail_issue:
-      self.ok = False
-      return False
-    return True
-
-  def reset(self):
-    self.reset_calls += 1
-
-  def release(self):
-    self.released = True
-    self.ok = False
-
-
-class TestCaptureAsyncPbo:
-  def _wire(self, monkeypatch, app, *, w=2, h=2):
-    fb_binds = []
-    monkeypatch.setattr(app_mod, "rl", types.SimpleNamespace(
-      load_image_from_texture=lambda _tex: types.SimpleNamespace(width=w, height=h, data=bytes(w * h * 4)),
-      unload_image=lambda img: None,
-      ffi=types.SimpleNamespace(memmove=lambda dest, src, n: dest.__setitem__(slice(0, n), src[:n])),
-      rl_enable_framebuffer=lambda fbo: fb_binds.append(fbo),
-      rl_disable_framebuffer=lambda: fb_binds.append(0),
-    ))
-    app._render_texture = types.SimpleNamespace(id=7, texture=types.SimpleNamespace(width=w, height=h))
-    app._capture_metrics = types.SimpleNamespace(end=lambda tok: None, flush=lambda: None)
-    app._ffmpeg_queue = queue.Queue(maxsize=8)
-    app._ffmpeg_enqueue_lock = threading.Lock()
-    app._ffmpeg_stop_event = threading.Event()
-    app._record_failure_event = threading.Event()
-    return fb_binds
-
-  def _async_app(self, monkeypatch, pbo, *, w=2, h=2):
-    app = make_app(_record_pbo=pbo, _record_pbo_disabled=False, _record_pbo_logged=True)
-    app._ensure_record_buf_pool(w * h * 4)
-    fb_binds = self._wire(monkeypatch, app, w=w, h=h)
-    return app, fb_binds
-
-  def test_priming_capture_no_frame_no_drop(self, monkeypatch):
-    # 세션 첫 캡처: issue만 걸리고 프레임/드랍/표본 없음 — buf는 풀로 회수
-    pbo = _FakeAppPbo(16)
-    app, fb_binds = self._async_app(monkeypatch, pbo)
-    app._capture_record_frame()
-    assert app._ffmpeg_queue.empty() and pbo.issued == 1
-    assert all(v == 0 for v in app._record_drop_counts.values())
-    assert app._record_buf_pool._q.qsize() == app._record_buf_count
-    assert fb_binds == [7, 0]  # rt FBO 바인드 후 기본 FBO 복원
-
-  def test_pipeline_enqueues_previous_frame(self, monkeypatch):
-    pbo = _FakeAppPbo(16, frames=[b"P" * 16])
-    app, _ = self._async_app(monkeypatch, pbo)
-    app._capture_record_frame()
-    assert app._ffmpeg_queue.qsize() == 1
-    assert bytes(app._ffmpeg_queue.get_nowait()) == b"P" * 16
-    assert app._record_buf_pool._q.qsize() == app._record_buf_count - 1  # 소유권은 writer로
-
-  def test_gl_error_falls_back_to_sync_same_frame(self, monkeypatch, capsys):
-    # PBO 실패 프레임도 드랍 없이 sync로 산출 + 이후 프로세스 영구 sync (로그 1회)
-    pbo = _FakeAppPbo(16, frames=[b"P" * 16], fail_issue=True)
-    app, _ = self._async_app(monkeypatch, pbo)
-    app._capture_record_frame()
-    assert app._ffmpeg_queue.qsize() == 1  # sync 폴백이 같은 프레임을 채웠다
-    assert app._record_pbo_disabled is True and pbo.released is True
-    app._capture_record_frame()  # 이후 캡처도 sync로 정상 진행
-    assert app._ffmpeg_queue.qsize() == 2
-    out = capsys.readouterr().out
-    assert out.count("sync fallback (gl error)") == 1
-
-  def test_rl_enable_exception_falls_back_to_sync_same_frame(self, monkeypatch, capsys):
-    # rlgl 계층(enable) 예외도 PBO GL 오류와 동일 폴백 — 프레임 무손실 + 영구 sync.
-    # enable이 try 밖이면 rt FBO가 바인드된 채 남아 다음 프레임이 rt에 그려진다
-    pbo = _FakeAppPbo(16, frames=[b"P" * 16])
-    app, fb_binds = self._async_app(monkeypatch, pbo)
-    def enable_boom(_fbo):
-      raise RuntimeError("rlgl enable failed")
-    monkeypatch.setattr(app_mod.rl, "rl_enable_framebuffer", enable_boom)
-    app._capture_record_frame()
-    assert fb_binds == [0]  # enable은 실패했어도 disable(복원)은 무조건 수행
-    assert app._ffmpeg_queue.qsize() == 1  # sync 폴백이 같은 프레임을 채웠다
-    assert app._record_pbo_disabled is True and pbo.released is True
-    assert capsys.readouterr().out.count("sync fallback (gl error)") == 1
-
-  def test_size_mismatch_counted_once_without_sync_retry(self, monkeypatch):
-    # 텍스처/풀 세대 불일치는 PBO·sync 어느 쪽으로도 같은 결과 — 이중 계수 금지
-    pbo = _FakeAppPbo(64, frames=[b"P" * 64])
-    app, _ = self._async_app(monkeypatch, pbo)  # 텍스처 2x2x4=16 vs 풀/PBO 64
-    app._ensure_record_buf_pool(64)
-    app._capture_record_frame()
-    assert app._record_drop_counts["size_mismatch"] == 1
-    assert app._ffmpeg_queue.empty() and pbo.issued == 0
-
-  def test_ensure_pbo_creates_reuses_and_regenerates(self, monkeypatch):
-    made = []
-    def fake_create(size):
-      made.append(size)
-      return _FakeAppPbo(size)
-    monkeypatch.setattr(app_mod.carrot_pbo_readback, "create", fake_create)
-    app = make_app(_record_pbo=None, _record_pbo_disabled=False, _record_pbo_logged=True)
-    self._wire(monkeypatch, app)  # hasattr(rl, rl_enable_framebuffer) 충족용
-    first = app._ensure_record_pbo(16)
-    assert first is not None and made == [16]
-    assert app._ensure_record_pbo(16) is first  # 같은 크기 — 프로세스 수명 재사용
-    second = app._ensure_record_pbo(64)  # 크기 세대 교체 — 이전 GL 버퍼 반납
-    assert second is not first and first.released is True and made == [16, 64]
-
-  def test_ensure_pbo_unavailable_disables_once(self, monkeypatch, capsys):
-    calls = []
-    monkeypatch.setattr(app_mod.carrot_pbo_readback, "create", lambda size: calls.append(size))
-    app = make_app(_record_pbo=None, _record_pbo_disabled=False, _record_pbo_logged=False)
-    self._wire(monkeypatch, app)
-    assert app._ensure_record_pbo(16) is None and app._record_pbo_disabled is True
-    assert app._ensure_record_pbo(16) is None  # 재시도 없음 — GL 오류 반복 유발 금지
-    assert calls == [16]
-    assert capsys.readouterr().out.count("sync fallback (pbo unavailable)") == 1
-
-  def test_start_recording_resets_pbo_pending(self, monkeypatch):
-    from pathlib import Path
-    pbo = _FakeAppPbo(16)
-    app = make_app(_record_pbo=pbo, _record_pbo_disabled=False, _record_pbo_logged=True)
-    app._ensure_render_texture_for_recording = lambda: None
-    app._render_texture = types.SimpleNamespace(texture=types.SimpleNamespace(width=2, height=2))
-    app._new_record_path = lambda: Path("/tmp/x.mp4")
-    app._init_ffmpeg = lambda p: True
-    app.start_recording()
-    assert app._record_enabled is True and pbo.reset_calls == 1
+  def test_pbo_module_removed(self):
+    import importlib
+    try:
+      importlib.import_module("openpilot.system.ui.lib.carrot_pbo_readback")
+      raise AssertionError("carrot_pbo_readback은 제거된 모듈이다 — 재도입에는 실측 근거 필요")
+    except ModuleNotFoundError:
+      pass
 
   def test_default_buf_count_is_eight(self):
     # route 0000041f session2 pool_empty=2 — 회전 겹침(old writer 미반환 + 새 세션
-    # 캡처) 흡수 상한 8 고정. 무제한 보충 재도입 금지
+    # 캡처) 흡수 상한 8은 route421에서 drop 전부 0으로 입증돼 유지한다.
+    # 무제한 보충 재도입 금지
     tree = ast.parse(inspect.getsource(app_mod))
     values = [node.value.value for node in ast.walk(tree)
               if isinstance(node, ast.Assign)
