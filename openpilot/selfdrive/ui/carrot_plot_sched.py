@@ -1,14 +1,20 @@
-"""carrot 전용: DebugPlot 활성 시 UI 메인 스레드를 planner 아래로 강등하는 안전 경계.
+"""carrot 전용: DebugPlot 활성 시 UI 메인 스레드를 비RT(SCHED_OTHER)로 강등하는 안전 경계.
 
-DebugPlot은 프레임당 수천 draw 콜로 UI를 상시 실행 상태로 만드는데, UI가
-SCHED_FIFO 53으로 core5를 점유하면 같은 코어의 plannerd/radard(FIFO 51)가 굶어
+DebugPlot은 프레임당 수천 draw 콜로 UI를 상시 실행 상태로 만든다. UI가 SCHED_FIFO
+53으로 core5를 점유하던 시절에는 같은 코어의 plannerd/radard(FIFO 51)가 굶어
 longitudinalPlan/radarState 발행이 끊기고 commIssueAvgFreq → softDisable이
-발생한다 (2026-07-11 route 416 실주행 해제 사고 — ScreenRecord ffmpeg 시작보다
+발생했다 (2026-07-11 route 416 실주행 해제 사고 — ScreenRecord ffmpeg 시작보다
 1초 먼저 disengage가 났고, ffmpeg 종료 후에도 122초간 지속됨).
+
+현재 UI는 core7(modeld FIFO54와 공유)로 분리되어 planner/radar와 코어 자체가
+다르지만(route 00000426 core5 포화 재발의 수정), 이 게이트는 유지한다 — plot의
+상시 렌더 부하가 FIFO53으로 돌 이유가 없고, 강등하면 같은 코어의 modeld를 추가로
+보호한다 (FIFO54가 어차피 선점하지만 비RT UI는 선점 지연조차 만들지 않는다).
 
 강등이 실제로 적용된 것을 검증한 경우에만 plot을 허용한다 (fail-closed).
 plot을 그리는 쪽은 파라미터를 직접 읽지 말고 effective_mode를 읽어야 한다.
-core5 affinity는 유지한다 — SCHED_OTHER면 같은 코어의 FIFO 51이 항상 선점한다.
+core7 affinity는 유지한다 — SCHED_OTHER UI는 같은 코어의 modeld(FIFO 54)가 항상
+선점한다.
 """
 import os
 import sys
@@ -20,7 +26,7 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.ui.carrot_params_watch import ParamsRefreshGate
 from openpilot.system.hardware import PC
 
-UI_CORE = 5
+UI_CORE = 7
 PLOT_MODE_MIN, PLOT_MODE_MAX = 1, 8  # 공식 지원 plot 모드 범위
 
 
@@ -63,7 +69,7 @@ class PlotSchedGate:
 
   @staticmethod
   def _restore() -> bool:
-    """FIFO 53 + core5 복구. 실패하면 SCHED_OTHER 롤백을 시도한다.
+    """FIFO 53 + core7 복구. 실패하면 SCHED_OTHER 롤백을 시도한다.
 
     affinity를 먼저(아직 SCHED_OTHER일 때), FIFO 승격을 마지막에 수행해 'False인데
     FIFO 잔류' 같은 부분 성공을 막는다. 단, 커널이 롤백 syscall까지 거부하면
@@ -121,14 +127,15 @@ class PlotSchedGate:
     if mode > 0 and not self._demoted and self._failed_mode is None:
       if self._demote():
         self._demoted = True
-        cloudlog.warning("PLOTSCHED: DebugPlot active, UI demoted to SCHED_OTHER/core5")
+        cloudlog.warning("PLOTSCHED: DebugPlot active, UI demoted to SCHED_OTHER/core7")
       else:
-        # 강등 안 된 FIFO 53 UI로 plot을 그리면 planner가 굶으므로 plot을 켜지 않는다
+        # 강등 안 된 FIFO 53 UI로 plot을 그리면 상시 RT 렌더 부하가 남으므로
+        # plot을 켜지 않는다 (fail-closed)
         self._failed_mode = mode
         cloudlog.error("PLOTSCHED: UI demotion FAILED, DebugPlot disabled (fail-closed)")
     elif mode == 0 and self._demoted:
       if self._restore():
-        cloudlog.warning("PLOTSCHED: DebugPlot inactive, UI restored to SCHED_FIFO 53")
+        cloudlog.warning("PLOTSCHED: DebugPlot inactive, UI restored to SCHED_FIFO 53/core7")
       else:
         # 복구 실패는 안전 문제가 아니다(plot은 잠긴 상태, 재활성화는 _demote 검증
         # 필요) — UI를 죽이지 않고 실제 policy를 확인해 정확히 기록한다.

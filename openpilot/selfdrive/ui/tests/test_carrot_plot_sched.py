@@ -3,10 +3,14 @@
 route 416 주행 해제 사고의 수정을 고정한다: DebugPlot 활성 시 UI를 SCHED_OTHER로
 강등(fail-closed), 비활성 시 FIFO 53 복구(부분 성공 금지 — 실패 시 반드시 롤백),
 손상된 ShowPlotMode 값은 UI를 죽이지 않고 plot off로 처리.
+route 00000426(core5 포화 재발)의 수정도 고정한다: UI는 core7(modeld FIFO54가
+선점)로 분리 — core5 재도입 금지, 강등은 policy만 내리고 affinity는 불변.
 """
+import ast
 import os
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -152,7 +156,8 @@ class TestRestoreAtomicity:
                    drop_fails=0):
     calls = {"order": [], "rollback": 0}
     monkeypatch.setattr(cps, "PC", False)
-    state = {"policy": os.SCHED_OTHER, "prio": 0, "affinity": {UI_CORE}}
+    # 시작 affinity는 이전 core5 잔재 — restore가 실제로 {7}로 옮기는 것을 증명한다
+    state = {"policy": os.SCHED_OTHER, "prio": 0, "affinity": {5}}
 
     def fake_setaffinity(pid, cores):
       calls["order"].append("affinity")
@@ -173,18 +178,25 @@ class TestRestoreAtomicity:
       state["policy"], state["prio"] = os.SCHED_OTHER, 0
 
     def fake_getscheduler(pid):
+      calls["order"].append("read_policy")
       # 3중 검증에는 주입값(verify_policy)을, 롤백 readback에는 실제 상태를 돌려준다
       if verify_policy is not None and state["policy"] != os.SCHED_OTHER:
         return verify_policy
       return state["policy"]
 
+    def fake_getparam(pid):
+      calls["order"].append("read_prio")
+      return os.sched_param(state["prio"] if verify_priority is None else verify_priority)
+
+    def fake_getaffinity(pid):
+      calls["order"].append("read_affinity")
+      return state["affinity"] if verify_affinity is None else set(verify_affinity)
+
     monkeypatch.setattr(os, "sched_setaffinity", fake_setaffinity)
     monkeypatch.setattr(os, "sched_setscheduler", fake_setscheduler)
     monkeypatch.setattr(os, "sched_getscheduler", fake_getscheduler)
-    monkeypatch.setattr(os, "sched_getparam",
-                        lambda pid: os.sched_param(state["prio"] if verify_priority is None else verify_priority))
-    monkeypatch.setattr(os, "sched_getaffinity",
-                        lambda pid: state["affinity"] if verify_affinity is None else set(verify_affinity))
+    monkeypatch.setattr(os, "sched_getparam", fake_getparam)
+    monkeypatch.setattr(os, "sched_getaffinity", fake_getaffinity)
     monkeypatch.setattr(cps, "drop_realtime", fake_drop)
     result = PlotSchedGate._restore()
     return result, calls, state
@@ -193,9 +205,12 @@ class TestRestoreAtomicity:
     result, calls, state = self._run_restore(monkeypatch)
     assert result is True
     assert calls["rollback"] == 0
-    assert calls["order"] == ["affinity", "sched"]  # affinity 먼저, FIFO는 마지막
+    # syscall 순서: affinity 먼저(아직 SCHED_OTHER일 때) → FIFO 승격 → readback 검증
+    assert calls["order"][:2] == ["affinity", "sched"]
+    assert set(calls["order"][2:]) == {"read_policy", "read_prio", "read_affinity"}
     assert state["policy"] == os.SCHED_FIFO
     assert state["prio"] == Priority.CTRL_HIGH
+    assert state["affinity"] == {7}  # core5 잔재 → core7 (UI_CORE 동적 참조에 기대지 않음)
 
   def test_affinity_failure_never_promotes_to_fifo(self, monkeypatch):
     result, calls, state = self._run_restore(monkeypatch, affinity_raises=True)
@@ -242,6 +257,66 @@ class TestRestoreAtomicity:
     assert result is False
     assert calls["rollback"] == 2  # 재시도 상한 준수 (폭주 없음)
     assert state["policy"] == os.SCHED_FIFO  # 잔류를 숨기지 않고 그대로 노출
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="sched_* API는 Linux 전용")
+class TestDemoteContract:
+  """_demote는 policy만 SCHED_OTHER로 내린다 — affinity를 건드리면 UI가 core7
+  밖(planner/radar의 core5 등)으로 샐 수 있다."""
+
+  def _run_demote(self, monkeypatch, *, policy_after):
+    monkeypatch.setattr(cps, "PC", False)
+    affinity_calls = []
+    monkeypatch.setattr(os, "sched_setaffinity",
+                        lambda pid, c: affinity_calls.append(set(c)))
+    monkeypatch.setattr(cps, "drop_realtime", lambda: None)
+    monkeypatch.setattr(os, "sched_getscheduler", lambda pid: policy_after)
+    return PlotSchedGate._demote(), affinity_calls
+
+  def test_demotion_verified_policy_other(self, monkeypatch):
+    ok, _ = self._run_demote(monkeypatch, policy_after=os.SCHED_OTHER)
+    assert ok is True
+
+  def test_demotion_readback_mismatch_fails(self, monkeypatch):
+    # drop 콜이 성공해도 실제 policy가 OTHER가 아니면 강등 실패 (fail-closed)
+    ok, _ = self._run_demote(monkeypatch, policy_after=os.SCHED_FIFO)
+    assert ok is False
+
+  def test_demotion_never_touches_affinity(self, monkeypatch):
+    ok, affinity_calls = self._run_demote(monkeypatch, policy_after=os.SCHED_OTHER)
+    assert ok is True and affinity_calls == []
+
+
+class TestUiCoreSeparation:
+  """route 00000426: DebugPlot OFF에서도 UI(FIFO53)+radard(FIFO51)+plannerd
+  (FIFO51)가 core5를 공유해 94~107% 포화 → longitudinalPlan 16~18Hz →
+  softDisabling 반복. UI는 core7(modeld FIFO54가 선점)로 분리한다 —
+  core5 재도입 금지."""
+
+  def test_ui_core_is_seven(self):
+    assert UI_CORE == 7  # 명시적 고정 — 동적 참조 통과에 기대지 않는다
+
+  def test_ui_py_startup_pins_core7(self):
+    # ui.py는 import 부작용(gui_app 생성, 레이아웃→msgq)이 있어 AST로 고정한다
+    src = (Path(cps.__file__).parent / "ui.py").read_text()
+    tree = ast.parse(src)
+    config_calls = [
+      n for n in ast.walk(tree)
+      if isinstance(n, ast.Call)
+      and ((isinstance(n.func, ast.Name) and n.func.id == "config_realtime_process")
+           or (isinstance(n.func, ast.Attribute) and n.func.attr == "config_realtime_process"))
+    ]
+    assert len(config_calls) == 1
+    call = config_calls[0]
+    # 시작 affinity core7 (기존에는 upstream 잔재 core0로 시작해 re-affine이 5로 옮겼다)
+    assert isinstance(call.args[0], ast.Constant) and call.args[0].value == 7
+    prio = call.args[1]
+    assert isinstance(prio, ast.Attribute) and prio.attr == "CTRL_HIGH"  # FIFO53 유지
+    # re-affine 대상도 {7} — 파일 안 어떤 set 리터럴에도 5가 없어야 한다 (core5 재도입 금지)
+    core_sets = [frozenset(e.value for e in s.elts if isinstance(e, ast.Constant))
+                 for s in ast.walk(tree) if isinstance(s, ast.Set)]
+    assert frozenset({7}) in core_sets  # cores = {7, }
+    assert all(5 not in s for s in core_sets)
 
 
 class TestRestoreFailureLogging:
