@@ -1,10 +1,12 @@
 """carrot 전용: PlotSchedGate(DebugPlot 스케줄러 안전 경계) 회귀 테스트.
 
-route 416 주행 해제 사고의 수정을 고정한다: DebugPlot 활성 시 UI를 SCHED_OTHER로
-강등(fail-closed), 비활성 시 FIFO 53 복구(부분 성공 금지 — 실패 시 반드시 롤백),
-손상된 ShowPlotMode 값은 UI를 죽이지 않고 plot off로 처리.
-route 00000426(core5 포화 재발)의 수정도 고정한다: UI는 core7(modeld FIFO54가
-선점)로 분리 — core5 재도입 금지, 강등은 policy만 내리고 affinity는 불변.
+UI 상시 SCHED_OTHER/core7 설계를 고정한다 (route 416: FIFO53 UI가 core5의
+plannerd/radard FIFO51을 굶겨 해제 사고, route 00000426: core5 포화 재발,
+교차 리뷰: core7의 FIFO53 UI는 dmonitoringmodeld FIFO5를 굶겨 DM 지연 가능):
+- UI에 RT 승격 경로 재도입 금지 (FIFO 복구 기계 부재)
+- 부트스트랩은 core0(offroad power-save의 core4~7 offline 대응), 목표는 {7}
+- plot은 UI가 비RT임을 검증한 경우에만 허용(fail-closed), 강등은 affinity 불변
+- 손상된 ShowPlotMode 값은 UI를 죽이지 않고 plot off로 처리
 """
 import ast
 import os
@@ -15,12 +17,11 @@ from pathlib import Path
 import pytest
 
 import openpilot.selfdrive.ui.carrot_plot_sched as cps
-from openpilot.common.realtime import Priority
 from openpilot.selfdrive.ui.carrot_plot_sched import PLOT_MODE_MAX, PlotSchedGate, UI_CORE
 
 
-def make_gate(demote_results=(True,), restore_results=(True,)):
-  """syscall 없이 전이 로직만 검증하는 게이트 (읽기/강등/복구 스텁)."""
+def make_gate(demote_results=(True,)):
+  """syscall 없이 전이 로직만 검증하는 게이트 (읽기/강등 스텁 — 복구 경로는 없다)."""
   g = object.__new__(PlotSchedGate)
   g._raw_mode = 0
   g._effective_mode = 0
@@ -30,18 +31,13 @@ def make_gate(demote_results=(True,), restore_results=(True,)):
   g._params = types.SimpleNamespace()
   g._refresh_gate = types.SimpleNamespace(should_refresh=lambda now: True)
   g._read_mode = lambda: g._mode_to_set
-  calls = {"demote": 0, "restore": 0}
+  calls = {"demote": 0}
 
   def demote():
     calls["demote"] += 1
     return demote_results[min(calls["demote"] - 1, len(demote_results) - 1)]
 
-  def restore():
-    calls["restore"] += 1
-    return restore_results[min(calls["restore"] - 1, len(restore_results) - 1)]
-
   g._demote = demote
-  g._restore = restore
   return g, calls
 
 
@@ -53,7 +49,6 @@ class TestTransitions:
     for _ in range(50):  # 같은 모드 50프레임 — syscall 재호출 금지
       assert g.update() == 1
     assert calls["demote"] == 1
-    assert calls["restore"] == 0
 
   def test_mode_change_while_active_no_redemote(self):
     g, calls = make_gate()
@@ -63,7 +58,8 @@ class TestTransitions:
     assert g.update() == 2
     assert calls["demote"] == 1
 
-  def test_deactivate_restores_exactly_once(self):
+  def test_deactivate_clears_latch_without_syscall(self):
+    # 비활성 전이는 syscall 0회 — 복구할 RT 상태가 없다 (상시 SCHED_OTHER)
     g, calls = make_gate()
     g._mode_to_set = 1
     g.update()
@@ -71,7 +67,18 @@ class TestTransitions:
     assert g.update() == 0
     for _ in range(50):
       assert g.update() == 0
-    assert calls["restore"] == 1
+    assert calls["demote"] == 1  # 활성 전이의 검증 1회가 전부
+
+  def test_reactivate_reverifies_nonrt(self):
+    # off로 래치가 풀리면 다음 활성화가 비RT를 다시 검증해야 한다
+    g, calls = make_gate()
+    g._mode_to_set = 1
+    g.update()
+    g._mode_to_set = 0
+    g.update()
+    g._mode_to_set = 2
+    assert g.update() == 2
+    assert calls["demote"] == 2
 
   def test_demotion_failure_is_fail_closed_and_latched(self):
     g, calls = make_gate(demote_results=(False, True))
@@ -89,27 +96,14 @@ class TestTransitions:
     assert g.update() == 3
     assert calls["demote"] == 2
 
-  def test_restore_failure_no_exception_no_storm(self):
-    g, calls = make_gate(restore_results=(False,))
-    g._mode_to_set = 5
-    g.update()
-    g._mode_to_set = 0
-    assert g.update() == 0  # 예외 없이 effective 0
-    for _ in range(50):
-      g.update()
-    assert calls["restore"] == 1  # 실패 후 매 프레임 재시도 금지
-    g._mode_to_set = 5
-    assert g.update() == 5  # 이후 재활성화 정상 (demote 재호출)
-    assert calls["demote"] == 2
-
-  def test_active_to_invalid_mode_restores(self):
-    # 1 -> -1 전이: _read_mode 정규화(0)로 FIFO 복구가 반드시 수행돼야 한다
+  def test_active_to_invalid_mode_deactivates(self):
+    # 1 -> -1 전이: _read_mode 정규화(0)로 plot이 반드시 꺼져야 한다 (syscall 없음)
     g, calls = make_gate()
     g._mode_to_set = 1
     g.update()
     g._read_mode = lambda: 0  # -1은 _read_mode에서 0으로 정규화됨
     assert g.update() == 0
-    assert calls["restore"] == 1
+    assert calls["demote"] == 1
 
 
 class TestReadMode:
@@ -148,118 +142,6 @@ class TestReadMode:
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="sched_* API는 Linux 전용")
-class TestRestoreAtomicity:
-  """_restore는 부분 성공을 남기면 안 된다 — 실패 시 최종 상태는 반드시 SCHED_OTHER."""
-
-  def _run_restore(self, monkeypatch, *, affinity_raises=False, sched_raises=False,
-                   verify_policy=None, verify_priority=None, verify_affinity=None,
-                   drop_fails=0):
-    calls = {"order": [], "rollback": 0}
-    monkeypatch.setattr(cps, "PC", False)
-    # 시작 affinity는 이전 core5 잔재 — restore가 실제로 {7}로 옮기는 것을 증명한다
-    state = {"policy": os.SCHED_OTHER, "prio": 0, "affinity": {5}}
-
-    def fake_setaffinity(pid, cores):
-      calls["order"].append("affinity")
-      if affinity_raises:
-        raise OSError("affinity failed")
-      state["affinity"] = set(cores)
-
-    def fake_setscheduler(pid, policy, param):
-      calls["order"].append("sched")
-      if sched_raises:
-        raise OSError("sched failed")
-      state["policy"], state["prio"] = policy, param.sched_priority
-
-    def fake_drop():
-      calls["rollback"] += 1
-      if calls["rollback"] <= drop_fails:
-        raise OSError("rollback refused")
-      state["policy"], state["prio"] = os.SCHED_OTHER, 0
-
-    def fake_getscheduler(pid):
-      calls["order"].append("read_policy")
-      # 3중 검증에는 주입값(verify_policy)을, 롤백 readback에는 실제 상태를 돌려준다
-      if verify_policy is not None and state["policy"] != os.SCHED_OTHER:
-        return verify_policy
-      return state["policy"]
-
-    def fake_getparam(pid):
-      calls["order"].append("read_prio")
-      return os.sched_param(state["prio"] if verify_priority is None else verify_priority)
-
-    def fake_getaffinity(pid):
-      calls["order"].append("read_affinity")
-      return state["affinity"] if verify_affinity is None else set(verify_affinity)
-
-    monkeypatch.setattr(os, "sched_setaffinity", fake_setaffinity)
-    monkeypatch.setattr(os, "sched_setscheduler", fake_setscheduler)
-    monkeypatch.setattr(os, "sched_getscheduler", fake_getscheduler)
-    monkeypatch.setattr(os, "sched_getparam", fake_getparam)
-    monkeypatch.setattr(os, "sched_getaffinity", fake_getaffinity)
-    monkeypatch.setattr(cps, "drop_realtime", fake_drop)
-    result = PlotSchedGate._restore()
-    return result, calls, state
-
-  def test_success_verifies_policy_priority_affinity(self, monkeypatch):
-    result, calls, state = self._run_restore(monkeypatch)
-    assert result is True
-    assert calls["rollback"] == 0
-    # syscall 순서: affinity 먼저(아직 SCHED_OTHER일 때) → FIFO 승격 → readback 검증
-    assert calls["order"][:2] == ["affinity", "sched"]
-    assert set(calls["order"][2:]) == {"read_policy", "read_prio", "read_affinity"}
-    assert state["policy"] == os.SCHED_FIFO
-    assert state["prio"] == Priority.CTRL_HIGH
-    assert state["affinity"] == {7}  # core5 잔재 → core7 (UI_CORE 동적 참조에 기대지 않음)
-
-  def test_affinity_failure_never_promotes_to_fifo(self, monkeypatch):
-    result, calls, state = self._run_restore(monkeypatch, affinity_raises=True)
-    assert result is False
-    assert "sched" not in calls["order"]  # affinity 실패 시 FIFO 승격 자체가 없어야 함
-    assert calls["rollback"] == 1
-    assert state["policy"] == os.SCHED_OTHER
-
-  def test_sched_failure_rolls_back(self, monkeypatch):
-    result, calls, state = self._run_restore(monkeypatch, sched_raises=True)
-    assert result is False
-    assert calls["rollback"] == 1
-    assert state["policy"] == os.SCHED_OTHER
-
-  def test_verification_mismatch_rolls_back(self, monkeypatch):
-    # 설정 콜은 성공했지만 실제 policy가 FIFO가 아니면 롤백 후 False
-    result, calls, state = self._run_restore(monkeypatch, verify_policy=os.SCHED_OTHER)
-    assert result is False
-    assert calls["rollback"] == 1
-    assert state["policy"] == os.SCHED_OTHER
-
-  def test_priority_mismatch_rolls_back(self, monkeypatch):
-    result, calls, state = self._run_restore(monkeypatch, verify_priority=1)
-    assert result is False
-    assert calls["rollback"] >= 1
-    assert state["policy"] == os.SCHED_OTHER
-
-  def test_affinity_mismatch_rolls_back(self, monkeypatch):
-    result, calls, state = self._run_restore(monkeypatch, verify_affinity={0, UI_CORE})
-    assert result is False
-    assert calls["rollback"] >= 1
-    assert state["policy"] == os.SCHED_OTHER
-
-  def test_rollback_retry_succeeds_on_second_attempt(self, monkeypatch):
-    result, calls, state = self._run_restore(monkeypatch, verify_priority=1, drop_fails=1)
-    assert result is False
-    assert calls["rollback"] == 2  # 1차 실패 후 bounded 재시도
-    assert state["policy"] == os.SCHED_OTHER
-
-  def test_rollback_total_failure_returns_false_without_exception(self, monkeypatch):
-    # 커널이 롤백 syscall까지 거부: 예외 전파 없이 False, FIFO 잔류(파이썬에서 강제 불가).
-    # 이 상태에서도 update()는 plot을 잠그고 재활성화는 _demote 검증을 요구한다.
-    result, calls, state = self._run_restore(monkeypatch, verify_priority=1, drop_fails=2)
-    assert result is False
-    assert calls["rollback"] == 2  # 재시도 상한 준수 (폭주 없음)
-    assert state["policy"] == os.SCHED_FIFO  # 잔류를 숨기지 않고 그대로 노출
-
-
-@pytest.mark.skipif(sys.platform != "linux", reason="sched_* API는 Linux 전용")
 class TestDemoteContract:
   """_demote는 policy만 SCHED_OTHER로 내린다 — affinity를 건드리면 UI가 core7
   밖(planner/radar의 core5 등)으로 샐 수 있다."""
@@ -287,60 +169,83 @@ class TestDemoteContract:
     assert ok is True and affinity_calls == []
 
 
+def _ui_py_tree():
+  # ui.py는 import 부작용(gui_app 생성, 레이아웃→msgq)이 있어 AST로 고정한다
+  return ast.parse((Path(cps.__file__).parent / "ui.py").read_text())
+
+
+def _call_names(tree):
+  names = []
+  for n in ast.walk(tree):
+    if isinstance(n, ast.Call):
+      if isinstance(n.func, ast.Name):
+        names.append(n.func.id)
+      elif isinstance(n.func, ast.Attribute):
+        names.append(n.func.attr)
+  return names
+
+
 class TestUiCoreSeparation:
-  """route 00000426: DebugPlot OFF에서도 UI(FIFO53)+radard(FIFO51)+plannerd
-  (FIFO51)가 core5를 공유해 94~107% 포화 → longitudinalPlan 16~18Hz →
-  softDisabling 반복. UI는 core7(modeld FIFO54가 선점)로 분리한다 —
-  core5 재도입 금지."""
+  """route 00000426: DebugPlot OFF에서도 UI+radard+plannerd가 core5를 공유해
+  94~107% 포화 → longitudinalPlan 16~18Hz → softDisabling 반복. UI는 core0
+  부트스트랩(offroad power-save는 core4~7 offline — always_run UI가 offline
+  core7 affinity로 시작하면 크래시/재시작 루프) 후 render loop가 core7로
+  re-affine한다. core5 재도입 금지."""
 
   def test_ui_core_is_seven(self):
     assert UI_CORE == 7  # 명시적 고정 — 동적 참조 통과에 기대지 않는다
 
-  def test_ui_py_startup_pins_core7(self):
-    # ui.py는 import 부작용(gui_app 생성, 레이아웃→msgq)이 있어 AST로 고정한다
-    src = (Path(cps.__file__).parent / "ui.py").read_text()
+  def test_ui_py_bootstraps_core0_and_reaffines_core7(self):
+    tree = _ui_py_tree()
+    # 부트스트랩: set_core_affinity([0]) — 항상 online인 core0에서 시작
+    aff_shapes = []
+    for n in ast.walk(tree):
+      if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+              and n.func.id == "set_core_affinity"):
+        continue
+      a = n.args[0]
+      if isinstance(a, ast.List) and len(a.elts) == 1 and isinstance(a.elts[0], ast.Constant):
+        aff_shapes.append(("const_list", a.elts[0].value))
+      elif (isinstance(a, ast.Call) and isinstance(a.func, ast.Name) and a.func.id == "list"
+            and len(a.args) == 1 and isinstance(a.args[0], ast.Name)):
+        aff_shapes.append(("list_of_var", a.args[0].id))
+    assert ("const_list", 0) in aff_shapes      # core0 부트스트랩
+    # re-affine이 cores 변수와 직접 연결 — cores만 바꾸면 대상이 함께 바뀐다
+    assert ("list_of_var", "cores") in aff_shapes
+
+  def test_ui_py_cores_var_is_ui_core_single_source(self):
+    tree = _ui_py_tree()
+    sets = [s for s in ast.walk(tree) if isinstance(s, ast.Set)]
+    # cores = {UI_CORE, } — 리터럴 하드코딩 대신 단일 출처 상수를 쓴다
+    assert any(len(s.elts) == 1 and isinstance(s.elts[0], ast.Name)
+               and s.elts[0].id == "UI_CORE" for s in sets)
+    # 어떤 set 리터럴에도 core5 상수가 없어야 한다 (재도입 금지)
+    consts = {e.value for s in sets for e in s.elts if isinstance(e, ast.Constant)}
+    assert 5 not in consts
+    # UI_CORE는 carrot_plot_sched에서 임포트한다 (값 분기 금지)
+    imports = [n for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
+               and n.module and n.module.endswith("carrot_plot_sched")]
+    assert any(alias.name == "UI_CORE" for n in imports for alias in n.names)
+
+
+class TestNoRtPromotion:
+  """UI에 RT 승격 경로가 없어야 한다 (교차 리뷰 blocker): FIFO53 UI는 core7의
+  dmonitoringmodeld(FIFO5)를 굶겨 운전자 감시를 지연시킬 수 있고, offroad
+  core7 offline 상태의 시작 승격은 startup 크래시를 만든다. UI는 상시
+  SCHED_OTHER — 어느 소스에도 승격 프리미티브 재도입 금지."""
+
+  def test_restore_machinery_removed(self):
+    assert not hasattr(PlotSchedGate, "_restore")
+    assert not hasattr(PlotSchedGate, "_rollback_to_other")
+
+  def test_no_promotion_primitives_in_ui_py(self):
+    names = _call_names(_ui_py_tree())
+    assert "config_realtime_process" not in names  # 시작 FIFO 승격 금지
+    assert "sched_setscheduler" not in names
+
+  def test_no_promotion_primitives_in_plot_sched(self):
+    src = (Path(cps.__file__).parent / "carrot_plot_sched.py").read_text()
     tree = ast.parse(src)
-    config_calls = [
-      n for n in ast.walk(tree)
-      if isinstance(n, ast.Call)
-      and ((isinstance(n.func, ast.Name) and n.func.id == "config_realtime_process")
-           or (isinstance(n.func, ast.Attribute) and n.func.attr == "config_realtime_process"))
-    ]
-    assert len(config_calls) == 1
-    call = config_calls[0]
-    # 시작 affinity core7 (기존에는 upstream 잔재 core0로 시작해 re-affine이 5로 옮겼다)
-    assert isinstance(call.args[0], ast.Constant) and call.args[0].value == 7
-    prio = call.args[1]
-    assert isinstance(prio, ast.Attribute) and prio.attr == "CTRL_HIGH"  # FIFO53 유지
-    # re-affine 대상도 {7} — 파일 안 어떤 set 리터럴에도 5가 없어야 한다 (core5 재도입 금지)
-    core_sets = [frozenset(e.value for e in s.elts if isinstance(e, ast.Constant))
-                 for s in ast.walk(tree) if isinstance(s, ast.Set)]
-    assert frozenset({7}) in core_sets  # cores = {7, }
-    assert all(5 not in s for s in core_sets)
-
-
-class TestRestoreFailureLogging:
-  """update()의 복구 실패 로그가 실제 policy와 모순되지 않아야 한다."""
-
-  def _gate_with_log(self, monkeypatch, policy):
-    logs = {"error": [], "critical": [], "warning": []}
-    monkeypatch.setattr(cps, "cloudlog", types.SimpleNamespace(
-      error=logs["error"].append, critical=logs["critical"].append,
-      warning=logs["warning"].append, exception=lambda m: None))
-    g, _ = make_gate(restore_results=(False,))
-    g._current_policy = lambda: policy
-    g._mode_to_set = 1
-    g.update()
-    g._mode_to_set = 0
-    g.update()
-    return logs
-
-  def test_rolled_back_logs_staying_other(self, monkeypatch):
-    logs = self._gate_with_log(monkeypatch, os.SCHED_OTHER)
-    assert any("staying SCHED_OTHER" in m for m in logs["error"])
-    assert not logs["critical"]
-
-  def test_rollback_failed_logs_actual_policy(self, monkeypatch):
-    logs = self._gate_with_log(monkeypatch, os.SCHED_FIFO)
-    assert any("rollback FAILED" in m and f"policy={os.SCHED_FIFO}" in m for m in logs["critical"])
-    assert not any("staying SCHED_OTHER" in m for m in logs["error"])
+    assert "sched_setscheduler" not in _call_names(tree)  # drop_realtime 경유만 허용
+    attrs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    assert "SCHED_FIFO" not in attrs and "CTRL_HIGH" not in attrs

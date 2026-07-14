@@ -1,32 +1,30 @@
-"""carrot 전용: DebugPlot 활성 시 UI 메인 스레드를 비RT(SCHED_OTHER)로 강등하는 안전 경계.
+"""carrot 전용: DebugPlot 활성 시 UI가 실제로 비RT(SCHED_OTHER)임을 검증하는 안전 경계.
 
-DebugPlot은 프레임당 수천 draw 콜로 UI를 상시 실행 상태로 만든다. UI가 SCHED_FIFO
-53으로 core5를 점유하던 시절에는 같은 코어의 plannerd/radard(FIFO 51)가 굶어
-longitudinalPlan/radarState 발행이 끊기고 commIssueAvgFreq → softDisable이
-발생했다 (2026-07-11 route 416 실주행 해제 사고 — ScreenRecord ffmpeg 시작보다
-1초 먼저 disengage가 났고, ffmpeg 종료 후에도 122초간 지속됨).
+UI는 상시 SCHED_OTHER/core7로 운용한다 — RT 승격이 없어야 core7의
+modeld(FIFO54)는 물론 dmonitoringmodeld(FIFO5)도 UI를 선점할 수 있다.
+FIFO53 UI의 사고 이력: core5 시절에는 같은 코어의 plannerd/radard(FIFO51)를
+굶겨 longitudinalPlan/radarState 발행이 끊기고 commIssueAvgFreq → softDisable
+(2026-07-11 route 416 실주행 해제 사고, 2026-07-14 route 00000426 core5 포화
+재발), core7로 옮겨도 FIFO53이면 DM 활성 구성의 dmonitoringmodeld(FIFO5)를
+굶겨 운전자 감시가 지연될 수 있다. 그래서 이 모듈에는 FIFO 승격/복구 경로
+자체가 없다 — 재도입 금지.
 
-현재 UI는 core7(modeld FIFO54와 공유)로 분리되어 planner/radar와 코어 자체가
-다르지만(route 00000426 core5 포화 재발의 수정), 이 게이트는 유지한다 — plot의
-상시 렌더 부하가 FIFO53으로 돌 이유가 없고, 강등하면 같은 코어의 modeld를 추가로
-보호한다 (FIFO54가 어차피 선점하지만 비RT UI는 선점 지연조차 만들지 않는다).
-
-강등이 실제로 적용된 것을 검증한 경우에만 plot을 허용한다 (fail-closed).
+DebugPlot은 프레임당 수천 draw 콜로 UI를 상시 실행 상태로 만들므로, plot은
+UI가 비RT임을 검증(어긋나 있으면 강등)한 경우에만 허용한다 (fail-closed).
 plot을 그리는 쪽은 파라미터를 직접 읽지 말고 effective_mode를 읽어야 한다.
-core7 affinity는 유지한다 — SCHED_OTHER UI는 같은 코어의 modeld(FIFO 54)가 항상
-선점한다.
+affinity는 건드리지 않는다 — core 배치는 ui.py의 부트스트랩/re-affine 소관.
 """
 import os
 import sys
 import time
 
 from openpilot.common.params import Params
-from openpilot.common.realtime import Priority, drop_realtime
+from openpilot.common.realtime import drop_realtime
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.ui.carrot_params_watch import ParamsRefreshGate
 from openpilot.system.hardware import PC
 
-UI_CORE = 7
+UI_CORE = 7  # UI 목표 코어 (ui.py의 부트스트랩 후 re-affine 대상) — 단일 출처
 PLOT_MODE_MIN, PLOT_MODE_MAX = 1, 8  # 공식 지원 plot 모드 범위
 
 
@@ -46,7 +44,9 @@ class PlotSchedGate:
 
   @staticmethod
   def _demote() -> bool:
-    """UI 메인 스레드를 SCHED_OTHER로 내리고 실제 적용을 검증한다 (affinity는 그대로)."""
+    """UI 메인 스레드가 비RT(SCHED_OTHER)임을 보장하고 readback으로 검증한다.
+    상시 SCHED_OTHER 설계에서 정상이라면 이미 OTHER라 no-op 검증만 통과한다 —
+    어떤 경로로든 RT로 어긋나 있으면 여기서 내린다 (affinity는 건드리지 않는다)."""
     if sys.platform != "linux" or PC:
       return True  # RT 스케줄링이 없는 환경은 강등 자체가 불필요
     try:
@@ -54,51 +54,6 @@ class PlotSchedGate:
       return os.sched_getscheduler(0) == os.SCHED_OTHER
     except OSError:
       return False
-
-  @staticmethod
-  def _rollback_to_other() -> bool:
-    """SCHED_OTHER 복귀를 readback 검증 포함 최대 2회 시도한다."""
-    for _ in range(2):
-      try:
-        drop_realtime()
-        if os.sched_getscheduler(0) == os.SCHED_OTHER:
-          return True
-      except OSError:
-        continue
-    return False
-
-  @staticmethod
-  def _restore() -> bool:
-    """FIFO 53 + core7 복구. 실패하면 SCHED_OTHER 롤백을 시도한다.
-
-    affinity를 먼저(아직 SCHED_OTHER일 때), FIFO 승격을 마지막에 수행해 'False인데
-    FIFO 잔류' 같은 부분 성공을 막는다. 단, 커널이 롤백 syscall까지 거부하면
-    파이썬에서 비RT를 강제할 수단이 없다 — 그 경우에도 plot은 fail-closed로 잠기고
-    (재활성화는 _demote 검증 필요) 'FIFO 53 + plot off'는 UI의 평상시 상태와 같으므로
-    fail-stop 대신 update()가 실제 policy를 정확히 기록한다.
-    """
-    if sys.platform != "linux" or PC:
-      return True
-    try:
-      os.sched_setaffinity(0, {UI_CORE})
-      os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(Priority.CTRL_HIGH))
-      ok = (os.sched_getscheduler(0) == os.SCHED_FIFO
-            and os.sched_getparam(0).sched_priority == Priority.CTRL_HIGH
-            and os.sched_getaffinity(0) == {UI_CORE})
-    except OSError:
-      ok = False
-    if not ok:
-      PlotSchedGate._rollback_to_other()  # 부분 성공했을 가능성까지 롤백
-    return ok
-
-  @staticmethod
-  def _current_policy() -> int:
-    if sys.platform != "linux":
-      return -1
-    try:
-      return os.sched_getscheduler(0)
-    except OSError:
-      return -1
 
   def _read_mode(self) -> int:
     """ShowPlotMode를 fail-closed로 읽는다. get_int()는 C++ std::stoi가 except+ 없이
@@ -116,7 +71,8 @@ class PlotSchedGate:
 
   def update(self) -> int:
     """ui.py 렌더 루프에서 매 프레임 호출. 파라미터는 실제로 바뀐 경우에만 재읽기,
-    스케줄러 syscall은 plot 활성/비활성 전이 시에만 1회 수행한다."""
+    스케줄러 syscall(비RT 검증/강등)은 plot 활성 전이 시에만 1회 수행한다 —
+    비활성 전이는 syscall 없음 (복구할 RT 상태가 없다)."""
     if self._refresh_gate.should_refresh(time.monotonic()):
       self._raw_mode = self._read_mode()
 
@@ -127,24 +83,18 @@ class PlotSchedGate:
     if mode > 0 and not self._demoted and self._failed_mode is None:
       if self._demote():
         self._demoted = True
-        cloudlog.warning("PLOTSCHED: DebugPlot active, UI demoted to SCHED_OTHER/core7")
+        cloudlog.warning("PLOTSCHED: DebugPlot active, UI non-RT verified (SCHED_OTHER/core7)")
       else:
-        # 강등 안 된 FIFO 53 UI로 plot을 그리면 상시 RT 렌더 부하가 남으므로
-        # plot을 켜지 않는다 (fail-closed)
+        # UI가 비RT임을 검증하지 못하면 plot을 켜지 않는다 (fail-closed) —
+        # RT UI로 plot을 그리면 같은 코어의 낮은 RT(dmonitoringmodeld FIFO5)가 굶는다
         self._failed_mode = mode
         cloudlog.error("PLOTSCHED: UI demotion FAILED, DebugPlot disabled (fail-closed)")
     elif mode == 0 and self._demoted:
-      if self._restore():
-        cloudlog.warning("PLOTSCHED: DebugPlot inactive, UI restored to SCHED_FIFO 53/core7")
-      else:
-        # 복구 실패는 안전 문제가 아니다(plot은 잠긴 상태, 재활성화는 _demote 검증
-        # 필요) — UI를 죽이지 않고 실제 policy를 확인해 정확히 기록한다.
-        policy = self._current_policy()
-        if policy == os.SCHED_OTHER:
-          cloudlog.error("PLOTSCHED: UI RT restore FAILED, staying SCHED_OTHER")
-        else:
-          cloudlog.critical(f"PLOTSCHED: UI RT restore FAILED and rollback FAILED (policy={policy}); plot remains disabled")
+      # 상시 SCHED_OTHER 설계 — 복구할 RT 상태가 없다 (FIFO 승격 재도입 금지:
+      # core7의 dmonitoringmodeld FIFO5를 굶긴다). 다음 활성화가 재검증하도록
+      # 래치만 푼다
       self._demoted = False
+      cloudlog.warning("PLOTSCHED: DebugPlot inactive")
 
     self._effective_mode = mode if (mode > 0 and self._demoted) else 0
     return self._effective_mode
