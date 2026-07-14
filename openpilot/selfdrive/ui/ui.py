@@ -14,17 +14,19 @@ BIG_UI = gui_app.big_ui()
 
 
 def main():
-  cores = {UI_CORE, }  # 단일 출처: carrot_plot_sched.UI_CORE (= 7)
-  # UI는 상시 SCHED_OTHER — RT 승격이 없어야 core7의 modeld(FIFO54)는 물론
-  # dmonitoringmodeld(FIFO5)도 UI를 선점할 수 있다. FIFO53 UI는 core5에서는
-  # plannerd/radard(FIFO51)를 굶겨 softDisable을(route 00000426: core5 포화로
-  # longitudinalPlan 16~18Hz), core7에서는 DM 활성 구성의 dmonitoringmodeld를
-  # 굶겨 운전자 감시 지연을 만들 수 있다. GC만 끈다 (GC pause가 프레임 히치를
-  # 만들지 않게 — 기존 config_realtime_process가 하던 것과 동일).
+  cores = {UI_CORE, }  # 단일 출처: carrot_plot_sched.UI_CORE (= 5)
+  # UI는 상시 SCHED_OTHER — 비RT UI는 어떤 RT도 선점하지 못하므로 core5의
+  # plannerd/radard(FIFO51)와 공유해도 기아가 없다 (route 416/00000426의
+  # 사고는 'FIFO53 UI가 FIFO51을 선점'이 전제였음 — RT 승격 재도입 금지).
+  # core7은 modeld(FIFO54)+dmonitoringmodeld(FIFO5) 전용으로 비워 둔다 —
+  # UI를 core7에 두는 안은 DM 기아 위험으로 기각됨 (교차 리뷰).
+  # GC만 끈다 (GC pause가 프레임 히치를 만들지 않게 — 기존
+  # config_realtime_process가 하던 것과 동일).
   gc.disable()
   # TICI offroad power-save는 big core4~7을 offline한다 — UI는 always_run이라
-  # 항상 online인 core0에서 부트스트랩하고, onroad에서 core7이 online되면
-  # 아래 render loop가 best-effort로 re-affine한다.
+  # 항상 online인 core0에서 부트스트랩하고, onroad에서 목표 코어가 online되면
+  # 아래 render loop가 best-effort로 re-affine한다 (실패는 삼키고 다음
+  # 프레임에 재시도).
   set_core_affinity([0])
 
   gui_app.init_window("UI")

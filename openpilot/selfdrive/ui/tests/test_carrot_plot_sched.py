@@ -1,10 +1,13 @@
 """carrot 전용: PlotSchedGate(DebugPlot 스케줄러 안전 경계) 회귀 테스트.
 
-UI 상시 SCHED_OTHER/core7 설계를 고정한다 (route 416: FIFO53 UI가 core5의
-plannerd/radard FIFO51을 굶겨 해제 사고, route 00000426: core5 포화 재발,
-교차 리뷰: core7의 FIFO53 UI는 dmonitoringmodeld FIFO5를 굶겨 DM 지연 가능):
-- UI에 RT 승격 경로 재도입 금지 (FIFO 복구 기계 부재)
-- 부트스트랩은 core0(offroad power-save의 core4~7 offline 대응), 목표는 {7}
+UI 상시 SCHED_OTHER 설계(scheduler/affinity foundation)를 고정한다 (route 416:
+FIFO53 UI가 core5의 plannerd/radard FIFO51을 굶겨 해제 사고, route 00000426:
+core5 포화 재발, 교차 리뷰: core7 이전안은 dmonitoringmodeld FIFO5 기아
+위험으로 기각):
+- UI에 RT 승격 경로 재도입 금지 (FIFO 복구 기계 부재, gc.disable은 유지)
+- 부트스트랩은 core0(offroad power-save의 core4~7 offline 대응), 목표는
+  UI_CORE=5 단일 출처 — 비RT UI는 FIFO51을 선점하지 못하므로 core5 공유 안전,
+  core7은 modeld+DM 전용 (재도입 금지)
 - plot은 UI가 비RT임을 검증한 경우에만 허용(fail-closed), 강등은 affinity 불변
 - 손상된 ShowPlotMode 값은 UI를 죽이지 않고 plot off로 처리
 """
@@ -186,16 +189,16 @@ def _call_names(tree):
 
 
 class TestUiCoreSeparation:
-  """route 00000426: DebugPlot OFF에서도 UI+radard+plannerd가 core5를 공유해
-  94~107% 포화 → longitudinalPlan 16~18Hz → softDisabling 반복. UI는 core0
-  부트스트랩(offroad power-save는 core4~7 offline — always_run UI가 offline
-  core7 affinity로 시작하면 크래시/재시작 루프) 후 render loop가 core7로
-  re-affine한다. core5 재도입 금지."""
+  """UI 코어 배치 foundation: core0 부트스트랩(offroad power-save는 core4~7을
+  offline — always_run UI가 offline 코어 affinity로 시작하면 크래시/재시작
+  루프) 후 render loop가 UI_CORE=5로 re-affine. 비RT UI는 core5의 FIFO51을
+  선점하지 못하므로 안전하고, core7은 modeld(FIFO54)+dmonitoringmodeld(FIFO5)
+  전용이라 UI 재배치 금지."""
 
-  def test_ui_core_is_seven(self):
-    assert UI_CORE == 7  # 명시적 고정 — 동적 참조 통과에 기대지 않는다
+  def test_ui_core_is_five(self):
+    assert UI_CORE == 5  # 명시적 고정 — 동적 참조 통과에 기대지 않는다
 
-  def test_ui_py_bootstraps_core0_and_reaffines_core7(self):
+  def test_ui_py_bootstraps_core0_and_reaffines_cores_var(self):
     tree = _ui_py_tree()
     # 부트스트랩: set_core_affinity([0]) — 항상 online인 core0에서 시작
     aff_shapes = []
@@ -211,6 +214,7 @@ class TestUiCoreSeparation:
         aff_shapes.append(("list_of_var", a.args[0].id))
     assert ("const_list", 0) in aff_shapes      # core0 부트스트랩
     # re-affine이 cores 변수와 직접 연결 — cores만 바꾸면 대상이 함께 바뀐다
+    # (cores = {UI_CORE,}이고 UI_CORE == 5이므로 결과적으로 {5}와의 관계가 고정)
     assert ("list_of_var", "cores") in aff_shapes
 
   def test_ui_py_cores_var_is_ui_core_single_source(self):
@@ -219,33 +223,86 @@ class TestUiCoreSeparation:
     # cores = {UI_CORE, } — 리터럴 하드코딩 대신 단일 출처 상수를 쓴다
     assert any(len(s.elts) == 1 and isinstance(s.elts[0], ast.Name)
                and s.elts[0].id == "UI_CORE" for s in sets)
-    # 어떤 set 리터럴에도 core5 상수가 없어야 한다 (재도입 금지)
+    # 어떤 set 리터럴에도 코어 상수가 없어야 한다 — 특히 core7 재도입 금지
+    # (core7은 modeld+DM 전용), core5도 리터럴 대신 UI_CORE 경유만 허용
     consts = {e.value for s in sets for e in s.elts if isinstance(e, ast.Constant)}
-    assert 5 not in consts
+    assert 7 not in consts and not consts
     # UI_CORE는 carrot_plot_sched에서 임포트한다 (값 분기 금지)
     imports = [n for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
                and n.module and n.module.endswith("carrot_plot_sched")]
     assert any(alias.name == "UI_CORE" for n in imports for alias in n.names)
 
+  def test_ui_py_gc_disable_retained(self):
+    # RT 승격 제거 과정에서 gc.disable()까지 사라지면 안 된다 — GC pause가
+    # 렌더 프레임 히치를 만든다 (기존 config_realtime_process가 하던 것)
+    tree = _ui_py_tree()
+    assert any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+               and n.func.attr == "disable" and isinstance(n.func.value, ast.Name)
+               and n.func.value.id == "gc" for n in ast.walk(tree))
+
+  def test_ui_py_reaffine_failure_swallowed_and_retryable(self):
+    # affinity 실패(offroad에 목표 코어 offline 등)가 UI 프로세스를 죽이면 안
+    # 된다 — try/except OSError로 삼키고, 호출부가 렌더 루프 안이라 다음
+    # 프레임에 자연 재시도된다
+    tree = _ui_py_tree()
+    def contains_reaffine(node):
+      return any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                 and n.func.id == "set_core_affinity"
+                 and n.args and isinstance(n.args[0], ast.Call)
+                 for n in ast.walk(node))
+    guarded = [t for t in ast.walk(tree) if isinstance(t, ast.Try) and contains_reaffine(t)
+               and any(isinstance(h.type, ast.Name) and h.type.id == "OSError"
+                       for h in t.handlers if h.type is not None)]
+    assert guarded, "re-affine은 try/except OSError 안에 있어야 한다"
+    # 그리고 그 try는 루프(render loop) 안에 있어야 재시도가 성립한다
+    loops = [n for n in ast.walk(tree) if isinstance(n, (ast.For, ast.While))]
+    assert any(any(t in ast.walk(loop) for t in guarded) for loop in loops)
+
 
 class TestNoRtPromotion:
-  """UI에 RT 승격 경로가 없어야 한다 (교차 리뷰 blocker): FIFO53 UI는 core7의
-  dmonitoringmodeld(FIFO5)를 굶겨 운전자 감시를 지연시킬 수 있고, offroad
-  core7 offline 상태의 시작 승격은 startup 크래시를 만든다. UI는 상시
-  SCHED_OTHER — 어느 소스에도 승격 프리미티브 재도입 금지."""
+  """UI에 RT 승격 경로가 없어야 한다: FIFO53 UI는 core5에서 plannerd/radard
+  (FIFO51)를 굶기고(route 416/00000426), core7에서는 dmonitoringmodeld(FIFO5)를
+  굶긴다(교차 리뷰). offroad에 offline 코어로의 시작 승격은 startup 크래시를
+  만든다. UI는 상시 SCHED_OTHER — 어느 소스에도 승격 프리미티브 재도입 금지."""
 
   def test_restore_machinery_removed(self):
     assert not hasattr(PlotSchedGate, "_restore")
     assert not hasattr(PlotSchedGate, "_rollback_to_other")
 
   def test_no_promotion_primitives_in_ui_py(self):
-    names = _call_names(_ui_py_tree())
-    assert "config_realtime_process" not in names  # 시작 FIFO 승격 금지
+    tree = _ui_py_tree()
+    names = _call_names(tree)
+    assert "config_realtime_process" not in names  # 시작 FIFO 승격 금지 (재도입 금지)
     assert "sched_setscheduler" not in names
+    attrs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    assert "SCHED_FIFO" not in attrs
+    # Priority(CTRL_HIGH/CTRL_LOW) 자체를 UI에서 쓰지 않는다
+    idents = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) for a in n.names}
+    assert "Priority" not in idents and "Priority" not in imported
+    assert "CTRL_HIGH" not in attrs and "CTRL_LOW" not in attrs
 
   def test_no_promotion_primitives_in_plot_sched(self):
     src = (Path(cps.__file__).parent / "carrot_plot_sched.py").read_text()
     tree = ast.parse(src)
     assert "sched_setscheduler" not in _call_names(tree)  # drop_realtime 경유만 허용
     attrs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
-    assert "SCHED_FIFO" not in attrs and "CTRL_HIGH" not in attrs
+    assert "SCHED_FIFO" not in attrs
+    assert "CTRL_HIGH" not in attrs and "CTRL_LOW" not in attrs
+
+
+class TestLegacyLogsRemoved:
+  # 과거 스케줄러 로그 문자열이 남아 있으면 실기기 tmux/rlog 분석이 구 설계
+  # (FIFO 복구/코어 표기)로 오판한다 — 소스 레벨에서 부재를 고정
+  LEGACY = (
+    "restored to SCHED_FIFO",       # FIFO 복구 로그 (복구 기계와 함께 제거됨)
+    "SCHED_OTHER/core5",            # route 416 시절 강등 로그
+    "SCHED_OTHER/core7",            # core7 이전안 로그
+    "UI RT restore FAILED",         # 복구 실패 로그 계열
+  )
+
+  def test_no_legacy_log_strings_in_sources(self):
+    for fname in ("carrot_plot_sched.py", "ui.py"):
+      src = (Path(cps.__file__).parent / fname).read_text()
+      for legacy in self.LEGACY:
+        assert legacy not in src, f"{fname}: 과거 로그 문자열 잔존 — {legacy}"

@@ -1,13 +1,14 @@
 """carrot 전용: DebugPlot 활성 시 UI가 실제로 비RT(SCHED_OTHER)임을 검증하는 안전 경계.
 
-UI는 상시 SCHED_OTHER/core7로 운용한다 — RT 승격이 없어야 core7의
-modeld(FIFO54)는 물론 dmonitoringmodeld(FIFO5)도 UI를 선점할 수 있다.
-FIFO53 UI의 사고 이력: core5 시절에는 같은 코어의 plannerd/radard(FIFO51)를
-굶겨 longitudinalPlan/radarState 발행이 끊기고 commIssueAvgFreq → softDisable
+UI는 상시 SCHED_OTHER로 운용한다 — 비RT UI는 어떤 RT도 선점하지 못하므로
+core5의 plannerd/radard(FIFO51)와 코어를 공유해도 기아 구조가 성립하지 않는다.
+FIFO53 UI의 사고 이력이 이 설계의 근거다: core5에서는 FIFO51을 선점해
+longitudinalPlan/radarState 발행이 끊기고 commIssueAvgFreq → softDisable
 (2026-07-11 route 416 실주행 해제 사고, 2026-07-14 route 00000426 core5 포화
-재발), core7로 옮겨도 FIFO53이면 DM 활성 구성의 dmonitoringmodeld(FIFO5)를
-굶겨 운전자 감시가 지연될 수 있다. 그래서 이 모듈에는 FIFO 승격/복구 경로
-자체가 없다 — 재도입 금지.
+재발), core7로 옮기는 안은 DM 활성 구성의 dmonitoringmodeld(FIFO5)를 굶겨
+운전자 감시가 지연될 수 있어 기각됐다 (교차 리뷰). core7은 modeld(FIFO54)+
+dmonitoringmodeld(FIFO5) 전용으로 비워 둔다. 그래서 이 모듈에는 FIFO 승격/
+복구 경로 자체가 없다 — 재도입 금지.
 
 DebugPlot은 프레임당 수천 draw 콜로 UI를 상시 실행 상태로 만들므로, plot은
 UI가 비RT임을 검증(어긋나 있으면 강등)한 경우에만 허용한다 (fail-closed).
@@ -24,7 +25,10 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.ui.carrot_params_watch import ParamsRefreshGate
 from openpilot.system.hardware import PC
 
-UI_CORE = 7  # UI 목표 코어 (ui.py의 부트스트랩 후 re-affine 대상) — 단일 출처
+# UI 목표 코어 (ui.py의 core0 부트스트랩 후 re-affine 대상) — 단일 출처.
+# 비RT UI는 FIFO51을 선점하지 못하므로 core5 공유가 안전하고, core7은
+# modeld(FIFO54)+dmonitoringmodeld(FIFO5) 전용으로 남긴다 (재배치 금지)
+UI_CORE = 5
 PLOT_MODE_MIN, PLOT_MODE_MAX = 1, 8  # 공식 지원 plot 모드 범위
 
 
@@ -83,16 +87,16 @@ class PlotSchedGate:
     if mode > 0 and not self._demoted and self._failed_mode is None:
       if self._demote():
         self._demoted = True
-        cloudlog.warning("PLOTSCHED: DebugPlot active, UI non-RT verified (SCHED_OTHER/core7)")
+        cloudlog.warning("PLOTSCHED: DebugPlot active, UI non-RT verified (SCHED_OTHER)")
       else:
         # UI가 비RT임을 검증하지 못하면 plot을 켜지 않는다 (fail-closed) —
-        # RT UI로 plot을 그리면 같은 코어의 낮은 RT(dmonitoringmodeld FIFO5)가 굶는다
+        # RT UI로 plot을 그리면 같은 코어의 plannerd/radard(FIFO51)가 굶는다 (route 416)
         self._failed_mode = mode
         cloudlog.error("PLOTSCHED: UI demotion FAILED, DebugPlot disabled (fail-closed)")
     elif mode == 0 and self._demoted:
       # 상시 SCHED_OTHER 설계 — 복구할 RT 상태가 없다 (FIFO 승격 재도입 금지:
-      # core7의 dmonitoringmodeld FIFO5를 굶긴다). 다음 활성화가 재검증하도록
-      # 래치만 푼다
+      # FIFO53 UI는 core5의 plannerd/radard FIFO51을 굶긴다 — route 416/
+      # 00000426). 다음 활성화가 재검증하도록 래치만 푼다
       self._demoted = False
       cloudlog.warning("PLOTSCHED: DebugPlot inactive")
 
