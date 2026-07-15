@@ -75,6 +75,10 @@ class AugmentedRoadView(CameraView):
     if not ui_state.started:
       return
     _tok = self._render_metrics.begin()
+    # 구간별 계측(계측 전용) — 렌더 호출 순서는 그대로, 각 구간 전후 monotonic만 잰다.
+    # scissor begin/end는 raylib 배치 flush 지점이라 특정 구간에 귀속시키지 않는다 —
+    # total과 구간 합의 차이로 남는다. extras = carrot 테두리(+텍스트)
+    cam_ms = model_ms = ds_ms = hud_ms = alert_ms = extras_ms = 0.0
 
     self._switch_stream_if_needed(ui_state.sm)
 
@@ -99,13 +103,23 @@ class AugmentedRoadView(CameraView):
     )
 
     # Render the base camera view
+    _t = time.monotonic()
     super()._render(rect)
+    cam_ms = (time.monotonic() - _t) * 1000.0
 
     # Draw all UI overlays
+    _t = time.monotonic()
     self.model_renderer.render(self._content_rect)
+    model_ms = (time.monotonic() - _t) * 1000.0
+    _t = time.monotonic()
     self._hud_renderer.render(self._content_rect)
+    hud_ms = (time.monotonic() - _t) * 1000.0
+    _t = time.monotonic()
     self.alert_renderer.render(self._content_rect)
+    alert_ms = (time.monotonic() - _t) * 1000.0
+    _t = time.monotonic()
     self.driver_state_renderer.render(self._content_rect)
+    ds_ms = (time.monotonic() - _t) * 1000.0
 
     # Custom UI extension point - add custom overlays here
     # Use self._content_rect for positioning within camera bounds
@@ -114,14 +128,25 @@ class AugmentedRoadView(CameraView):
     rl.end_scissor_mode()
 
     # Draw colored border based on driving state
+    _t = time.monotonic()
     self._draw_border_carrot(rect)
+    extras_ms = (time.monotonic() - _t) * 1000.0
 
     total = time.monotonic() - start_draw
 
     # publish uiDebug — 기존 drawTimeMillis 값을 먼저 확정한 뒤 계측을 기록해서
     # PLOTPERF emit(sort/문자열/cloudlog) 비용이 기존 지표의 spike로 오염되지 않게 한다
-    msg = messaging.new_message('uiDebug')
-    msg.uiDebug.drawTimeMillis = total * 1000
+    msg = messaging.new_message('uiDebug', valid=True)
+    ud = msg.uiDebug
+    ud.drawTimeMillis = total * 1000
+    ud.cameraTimeMillis = cam_ms
+    ud.modelTimeMillis = model_ms
+    ud.driverStateTimeMillis = ds_ms
+    ud.hudTimeMillis = hud_ms
+    ud.alertTimeMillis = alert_ms
+    ud.extrasTimeMillis = extras_ms
+    ud.plotMode = plot_sched_gate.effective_mode
+    ud.recording = gui_app.is_recording()
     self._render_metrics.end(_tok)
     # 중첩된 debugPlot 계측의 deferred 로그는 uiRender 샘플 종료 뒤에 배출 —
     # emit 비용이 drawTimeMillis에도, uiRender 윈도에도 들어가지 않는다
