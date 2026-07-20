@@ -183,7 +183,6 @@ async def run_upload_segments(segments: list[str], job: dict[str, Any] | None = 
   device_id = upload_device_id(meta)
   car_selected = meta.get("carName") or "none"
   storage_directory = f"{car_selected} {device_id}".strip()
-  upload_directory = device_id if target["kind"] == "carrot" else storage_directory
   if not token:
     if target["kind"] == "carrot":
       token = await create_web_upload_session(base_url, meta, "dashcam")
@@ -226,7 +225,7 @@ async def run_upload_segments(segments: list[str], job: dict[str, Any] | None = 
         files = await asyncio.to_thread(segment_file_summary, segment_path)
         ok = await upload_folder_to_web(
           segment_path,
-          upload_directory,
+          device_id,
           segment,
           base_url,
           token,
