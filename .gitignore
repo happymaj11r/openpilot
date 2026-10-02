@@ -114,3 +114,6 @@ Pipfile
 # Local-only model selector design notes (not shipped)
 docs/MODEL_SELECTOR_*.md
 docs/TOSS_LOG_SERVER_SPEC.md
+
+# Local Windows native CPU test builds
+*.pyd
