@@ -157,7 +157,7 @@ quiet-level = 3
 # if you've got a short variable name that's getting flagged, add it here
 ignore-words-list = "bu,ro,te,ue,alo,hda,ois,nam,nams,ned,som,parm,setts,inout,warmup,bumb,nd,sie,preints,whit,indexIn,ws,uint,grey,deque,stdio,amin,BA,LITE,atEnd,UIs,errorString,arange,FocusIn,od,tim,relA,hist,copyable,jupyter,thead,TGE,abl,lite,ser"
 builtin = "clear,rare,informal,code,names,en-GB_to_en-US"
-skip = "./third_party/*, ./tinygrad/*, ./tinygrad_repo/*, ./msgq/*, ./panda/*, ./opendbc/*, ./opendbc_repo/*, ./rednose/*, ./rednose_repo/*, ./teleoprtc/*, ./teleoprtc_repo/*, *.po, uv.lock, *.onnx, ./openpilot/cereal/gen/*, */c_generated_code/*, docs/assets/*, openpilot/tools/plotjuggler/layouts/*, openpilot/selfdrive/assets/offroad/mici_fcc.html"
+skip = "./third_party/*, ./tinygrad/*, ./tinygrad_repo/*, ./carrot/model_selector/genc/tinygrad_repo/*, ./msgq/*, ./panda/*, ./opendbc/*, ./opendbc_repo/*, ./rednose/*, ./rednose_repo/*, ./teleoprtc/*, ./teleoprtc_repo/*, *.po, uv.lock, *.onnx, ./openpilot/cereal/gen/*, */c_generated_code/*, docs/assets/*, openpilot/tools/plotjuggler/layouts/*, openpilot/selfdrive/assets/offroad/mici_fcc.html"
 
 # https://docs.astral.sh/ruff/configuration/#using-pyprojecttoml
 [tool.ruff]
@@ -190,6 +190,7 @@ exclude = [
   "opendbc_repo",
   "rednose_repo",
   "tinygrad_repo",
+  "carrot/model_selector/genc/tinygrad_repo",
   "teleoprtc",
   "teleoprtc_repo",
   "third_party",
@@ -230,6 +231,7 @@ exclude = [
   "rednose_repo/",
   "tinygrad/",
   "tinygrad_repo/",
+  "carrot/model_selector/genc/tinygrad_repo/",
   "teleoprtc/",
   "teleoprtc_repo/",
   "third_party/",

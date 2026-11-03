@@ -11,8 +11,19 @@ Carrot 파일럿 전용 주행 모델 다운로드/설치/적용 모듈. c3x·c4
      → **upstream `modeld.py` 를 그대로 재사용** — `MODELD_MODELS_DIR=/data/models` env 만 설정
      (`openpilot/selfdrive/modeld/helpers.py::modeld_pkl_path()` 가 env 를 읽어 경로 전환, monkey-patch 없음)
    - 커스텀 **구모델(vision+policy 분리)** (`/data/models/`) → **`carrot.model_selector.carrot_modeld` 가 담당** (3-모델 on/off policy 자체 지원)
-   - `modeld_runner` 가 부팅 시 `/data/models` 내용으로 셋 중 하나를 택일 실행
-   - upstream 이 바뀌어도 legacy 엔진과 무관하게 진행 가능
+   - 커스텀 **Gen C 모델(comma master 2026-10+ state-queue supercombo)** (`/data/models/driving_genc_tinygrad.pkl` + warp pkl + `genc_metadata.json`)
+     → **`carrot.model_selector.genc_modeld` 가 담당**. comma 가 핀한 신세대 tinygrad 를 `genc/tinygrad_repo/` 에 별도 벤더링하고
+     **Gen C 프로세스/컴파일 서브프로세스에서만** `sys.path` 우선 활성화 (시스템 tinygrad 를 쓰는 Gen A 엔진·dmonitoringmodeld 는 불변)
+   - `modeld_runner` 가 부팅 시 `/data/models` 내용으로 넷 중 하나를 택일 실행
+   - upstream 이 바뀌어도 legacy/Gen C 엔진과 무관하게 진행 가능
+
+   **supercombo 세대 판정은 ONNX 입력명 집합으로 결정론적** (`genc/generation.py`):
+
+   | 세대 | ONNX 입력 | 엔진 |
+   |------|-----------|------|
+   | A (2026-08, Lebowski/RDF/TSF…) | `img, big_img, desire_pulse, traffic_convention, action_t, features_buffer` | upstream modeld + `compile_modeld.py` |
+   | B (2026-09 중간형) | `warped`/`new_img` + `state_big_img_q`, `state_prev_feat`, … | **미지원** — 설치 단계에서 InstallError |
+   | C (2026-10+, comma master) | `new_img, desire, traffic_convention, action_t, state_img_q, state_desire_q, state_feat_q` (+ `next_state_*` 출력) | `genc_modeld` + 벤더 tinygrad `compile_onnx.py`/`compile_warp.py` |
 
 2. **upstream 파일 최소 침습** (각 1~3줄)
    - `openpilot/system/manager/process_config.py` — modeld 엔트리를 `openpilot.carrot.model_selector.modeld_runner` 로 교체
@@ -29,7 +40,7 @@ Carrot 파일럿 전용 주행 모델 다운로드/설치/적용 모듈. c3x·c4
    - 원본 파일(`openpilot/selfdrive/modeld/*`, `openpilot/common/file_chunker.py` 등)은 읽기/import 전용 (helpers.py env 훅 제외)
 
 4. **파일 세트 호환** (신형 단일 onnx 또는 구형 vision + 정책)
-   - **신형(supercombo)**: `driving_supercombo.onnx` 단독 — 존재 시 우선 적용
+   - **신형(supercombo)**: `driving_supercombo.onnx` 단독 — 존재 시 우선 적용 (Gen A/C 는 설치 시 자동 판별)
    - **구형(legacy)**: `driving_vision` 필수 + (`driving_on_policy` 또는 `driving_policy`) 중 하나 필수
    - `driving_off_policy` 는 선택적, 존재 시 3-모델 아키텍처 활성화 (구형 전용)
 
@@ -38,14 +49,16 @@ Carrot 파일럿 전용 주행 모델 다운로드/설치/적용 모듈. c3x·c4
 | 파일 | 책임 |
 |------|------|
 | `config.py` | 경로·파일명 상수, 허용 onnx 목록 (supercombo 포함), tinygrad 컴파일 플래그 |
-| `keys.py` | Ed25519 공개키 맵 + `MODEL_SELECTOR_VERSION` (v4: supercombo 지원) |
+| `keys.py` | Ed25519 공개키 맵 + `MODEL_SELECTOR_VERSION` (v4: supercombo 지원, v5: Gen C 지원) |
 | `manifest.py` | `models_v4.json`(전체 카탈로그) fetch → 실패 시 `models.json`(레거시, 동결) 폴백. 캐시버스터 `?t=unixtime` + no-cache 헤더 + canonical JSON Ed25519 검증. 버전 게이트를 파일명 검사보다 먼저 수행하고 해석 불가 항목은 스킵(전방 호환). snake_case/camelCase 필드 둘 다 수용 |
 | `downloader.py` | ONNX 스트리밍 다운로드 + SHA256/크기 검증. 공백 포함 파일명 URL percent-encoding. supercombo 단독 또는 legacy 세트 허용 |
-| `validator.py` | `/data/models/` 파일 세트 유효성 검증 (`has_supercombo` / legacy 세트) + `describe()` 라벨 |
-| `installer.py` | 신형: `compile_modeld.py` 로 통합 pkl 생성. 구형: tinygrad 컴파일 (compile3) + warp pkl. 공통: atomic swap + 실패 시 backup 복원 |
+| `validator.py` | `/data/models/` 파일 세트 유효성 검증 (`has_genc` / `has_supercombo` / legacy 세트) + `describe()` 라벨 |
+| `installer.py` | 신형: ONNX 입력명으로 세대 판별 → Gen A 는 `compile_modeld.py` 통합 pkl, Gen C 는 `genc/compile.py` (벤더 tinygrad). 구형: tinygrad 컴파일 (compile3) + warp pkl. 공통: atomic swap + 실패 시 backup 복원 |
 | `carrot_modeld.py` | **자체 modeld 엔진** — 구형 2/3-모델 공용, `/data/models` 전담 |
 | `carrot_parse_model_outputs.py` | 자체 parser (c3-ms 이식, `parse_off_policy_outputs` 포함) |
-| `modeld_runner.py` | 부팅 시 supercombo(upstream+env) / legacy(carrot_modeld) / 기본(upstream) 3-way 택일 실행 (dispatcher). `/data/model_selector_status` 에 엔진 정보 기록 |
+| `genc_modeld.py` | **Gen C modeld 엔진** — carrot modeld.py 의 main 루프(DesireHelper·MapInput·동적 lat smooth·diagnostics)에 `genc.runtime.ModelState` 를 결합. eGPU/Jetlink/shadow 미지원 |
+| `genc/` | Gen C 엔진 패키지: `generation.py`(세대 판정), `onnx_io.py`(그래프 I/O 프로브), `compile.py`(compile_onnx+compile_warp 래퍼·검증), `runtime.py`(comma master ModelState 이식), `pc_check.py`(PC 컴파일·추론 스모크), `device_preflight.py`(기기 프리플라이트), `tinygrad_repo/`(벤더 tinygrad, `PIN` 에 커밋) |
+| `modeld_runner.py` | 부팅 시 genc(genc_modeld) / supercombo(upstream+env) / legacy(carrot_modeld) / 기본(upstream) 4-way 택일 실행 (dispatcher). `/data/model_selector_status` 에 엔진 정보 기록 |
 | `boot_compile.py` | `manager.main` 초입 훅, pending 모델 컴파일 트리거 |
 | `jobs.py` | 간단한 in-memory job runner (web 진행률 폴링) |
 | `web/routes.py` | aiohttp 라우터 (list / status / install / job / apply / reset) |
@@ -79,10 +92,14 @@ Carrot 파일럿 전용 주행 모델 다운로드/설치/적용 모듈. c3x·c4
 
 [재부팅 → manager.main() 초입]
   └─ boot_compile.run() → installer.compile_pending()
-       ├─ [신형] driving_supercombo.onnx 존재 시:
-       │    └─ compile_modeld.py --model-size(metadata img 크기) --camera-resolutions 1928x1208 1344x760
-       │       --frame-skip(MODEL_RUN_FREQ//MODEL_CONTEXT_FREQ)
-       │       → 통합 driving_tinygrad.pkl (metadata + 모델 JIT + 해상도별 warp JIT)
+       ├─ [신형] driving_supercombo.onnx 존재 시: genc/onnx_io.py 로 입력명 프로브 → 세대 판정
+       │    ├─ Gen A → compile_modeld.py --model-size(metadata img 크기) --camera-resolutions 1928x1208 1344x760
+       │    │          --frame-skip(MODEL_RUN_FREQ//MODEL_CONTEXT_FREQ)
+       │    │          → 통합 driving_tinygrad.pkl (metadata + 모델 JIT + 해상도별 warp JIT)
+       │    ├─ Gen C → (벤더 tinygrad, PYTHONPATH 우선) compile_onnx.py --out-of-band → driving_genc_tinygrad.pkl
+       │    │          compile_warp.py --layout yuv420 --frames 2 (카메라별) → driving_genc_warp_{w}x{h}_tinygrad.pkl
+       │    │          + genc_metadata.json (입출력 shape·output_slices·compile_dev)
+       │    └─ 그 외(Gen B 등) → InstallError (백업 복원, pending 해제)
        ├─ [구형] ONNX → tinygrad.pkl + metadata.pkl (QCOM/FLOAT16/NOLOCALS/JIT_BATCH_SIZE=0/IMAGE=1/OPENPILOT_HACKS=1)
        │    └─ selected model metadata의 img 입력 크기로 standalone warp pkl 새로 생성 (빌트인 warp 재사용 안 함)
        ├─ atomic swap: /data/models_tmp → /data/models  (실패 시 backup 복원)
@@ -90,6 +107,9 @@ Carrot 파일럿 전용 주행 모델 다운로드/설치/적용 모듈. c3x·c4
 
 [process manager → `modeld` 프로세스 (only_onroad)]
   └─ modeld_runner.main()
+       ├─ validator.is_valid_genc_model_dir(/data/models) ?
+       │    └─ YES → status 기록(engine=genc_modeld)
+       │             genc_modeld.main()          ← Gen C 엔진 (벤더 tinygrad 활성화는 import 시점)
        ├─ validator.is_valid_supercombo_model_dir(/data/models) ?
        │    └─ YES → status 기록(engine=upstream_modeld_custom)
        │             MODELD_MODELS_DIR=/data/models 설정 후 upstream modeld.main()  ← 신형 엔진 재사용
@@ -118,8 +138,18 @@ pid=53610
 started=1776677826
 describe=/data/models: vision+on_policy+off_policy
 ```
-`engine` 값: `upstream_modeld_custom`(신형 supercombo 커스텀) / `carrot_modeld`(구형 커스텀) / `upstream_modeld`(기본).
+`engine` 값: `genc_modeld`(Gen C 커스텀) / `upstream_modeld_custom`(Gen A supercombo 커스텀) / `carrot_modeld`(구형 커스텀) / `upstream_modeld`(기본).
 `ps` 는 `setproctitle` 때문에 Python 모듈 경로가 마스킹되므로 이 파일이 결정적 출처.
+
+### Gen C 첫 기기 테스트 절차
+1. 프리플라이트 (offroad, 설치 전): `cd /data/openpilot && PYTHONPATH=/data/openpilot python3 carrot/model_selector/genc/device_preflight.py`
+   — 호스트 컴파일러(clang/libLLVM), QCOM 장치 오픈, JIT 커널, NPY↔장치 복사가 전부 PASS 여야 한다.
+   (comma master 는 AGNOS 20.x 기준, carrot-ms 는 19.8-carrot — 벤더 tinygrad 의 QCOM 런타임이 명령 제출 루틴을 CPU 에서 컴파일하므로 이 확인이 필요)
+2. manifest 에서 `minimum_selector_version: 5` 로 게이트된 Gen C 모델(예: comma master 스냅샷) 설치 → 재부팅 → `compile_pending` 로그
+   (`model_selector: Gen C supercombo detected … compiling with vendored tinygrad`), `/data/models/genc_metadata.json` 의 `compile_dev=QCOM`.
+3. onroad 후 `/data/model_selector_status` 의 `engine=genc_modeld`, `/data/models/.load_attempts` 가 90초 뒤 사라지는지(크래시 루프 차단기 미발동) 확인.
+   실패 시 3회 조기 크래시 후 `/data/models_quarantined` 로 격리되고 내장 모델로 자동 폴백된다.
+4. PC 에서 같은 파이프라인을 먼저 돌려볼 수 있다: `PYTHONPATH=<repo> python3 carrot/model_selector/genc/pc_check.py --onnx <driving_supercombo.onnx> --out <dir>` (DEV=CPU:LLVM, libLLVM 필요).
 
 ## 안전장치
 
@@ -134,6 +164,12 @@ describe=/data/models: vision+on_policy+off_policy
   — 필수 입력(img/big_img/desire_pulse/traffic_convention/action_t/features_buffer),
   `hidden_state` output slice, 모델 입력 크기 512x256(MEDMODEL — 런타임 warp 행렬이 이 크기에 고정) 을
   확인하고 미달 시 설치를 중단(백업 복원). 비호환 모델이 설치되어 크래시 루프에 빠지는 것을 사전 차단.
+  Gen C 는 `genc/compile.validate_genc_io` 가 같은 역할 (입력명 집합 정확 일치, `new_img` 2×6×128×256,
+  `desire`/`traffic_convention`/`action_t` 길이, `state_*_q` ↔ `next_state_*` shape 일치, 필수 output_slices).
+- **Gen C 엔진 격리** (`genc/__init__.activate_tinygrad`)
+  — 벤더 tinygrad 는 genc_modeld 프로세스와 Gen C 컴파일 서브프로세스(`PYTHONPATH` 선두)에서만 활성.
+  manager fork 로 시스템 tinygrad 모듈이 상속돼 있으면 `sys.modules` 에서 제거 후 재해석한다.
+  `genc_metadata.json` 의 `compile_dev` 로 런타임 백엔드를 컴파일 시점과 일치시킨다(QCOM / PC CPU:LLVM).
 - **크래시 루프 차단기** (`modeld_runner._arm_crash_loop_breaker`)
   — 커스텀 엔진 기동 시 `/data/models/.load_attempts` 카운터 증가, 90초 생존 시 자동 삭제.
   3회 연속 조기 크래시(현재 스탬프지만 손상된 pkl, 출력 slice 불일치 등) 시 `/data/models` 를
@@ -185,12 +221,13 @@ upstream 커밋은 주로 자동 체리픽으로 들어오므로, 셀렉터의 �
   — 체리픽/머지 후 `python3 carrot/model_selector/check_contracts.py` 실행.
   컴파일 스크립트 존재, compile_modeld CLI 인자, 메타데이터 파일명 규약,
   pkl 직렬화 쌍(dump_oob/load_oob), SConscript↔config 플래그, fill_model_msg
-  시그니처, ModelConstants, 프로세스/파람 배선을 검사한다. **FAIL 은 셀렉터
+  시그니처, ModelConstants, 프로세스/파람 배선, Gen C 엔진(벤더 tinygrad PIN·API,
+  설치/실행 분기 배선, 셀렉터 버전 ≥5)을 검사한다. **FAIL 은 셀렉터
   코드를 함께 적응시켜야 한다는 신호다.** 표준 라이브러리만 사용하므로 빌드
   없는 체크아웃에서도 돈다. (Hermes 지시문에 "체리픽 후 이 스크립트 실행 후
   PASS 확인" 한 줄을 넣어둘 것)
 - **미러 파일 변경 감지** (`check_contracts.py` 의 `modeld-mirror` 검사)
-  — `carrot_modeld.py`/`carrot_parse_model_outputs.py` 는 upstream `modeld.py`/
+  — `carrot_modeld.py`/`carrot_parse_model_outputs.py`/`genc_modeld.py` 는 upstream `modeld.py`/
   `parse_model_outputs.py` 를 **미러링**하는 독립 엔진이라, 원본 로직이 바뀌어도
   (예: 커밋 67b6f17d44 의 has_wide_camera 분기) 임포트처럼 자동 반영되지 않는다.
   `upstream_baseline/` 스냅샷과 현재 파일을 비교해 마지막 리뷰 이후의 변경을

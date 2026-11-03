@@ -168,7 +168,7 @@ def test_stale_supercombo_recompiles_and_atomically_swaps(model_paths, monkeypat
     assert (tmp_dir / f"{config.SUPERCOMBO_BASE}.onnx").read_bytes() == b"onnx"
     (tmp_dir / config.SUPERCOMBO_PKL_NAME).write_bytes(b"new-pkl")
 
-  monkeypatch.setattr(installer, "_compile_supercombo", compile_supercombo)
+  monkeypatch.setattr(installer, "_compile_supercombo_by_generation", compile_supercombo)
   installer.recompile_stale_if_needed()
 
   assert compile_calls == [(pending, "QCOM")]
@@ -217,7 +217,7 @@ def test_failed_recompile_preserves_old_model_and_falls_back(model_paths, monkey
   def fail_compile(_tmp_dir: Path, _env: dict[str, str]) -> None:
     raise RuntimeError("compiler failed")
 
-  monkeypatch.setattr(installer, "_compile_supercombo", fail_compile)
+  monkeypatch.setattr(installer, "_compile_supercombo_by_generation", fail_compile)
   installer.recompile_stale_if_needed()
 
   assert (models / config.SUPERCOMBO_PKL_NAME).read_bytes() == b"old-pkl"
@@ -250,7 +250,7 @@ def test_new_compiler_tag_retries_after_previous_failure(model_paths, monkeypatc
   def compile_supercombo(tmp_dir: Path, _env: dict[str, str]) -> None:
     (tmp_dir / config.SUPERCOMBO_PKL_NAME).write_bytes(b"retried-pkl")
 
-  monkeypatch.setattr(installer, "_compile_supercombo", compile_supercombo)
+  monkeypatch.setattr(installer, "_compile_supercombo_by_generation", compile_supercombo)
   installer.recompile_stale_if_needed()
 
   assert (models / config.SUPERCOMBO_PKL_NAME).read_bytes() == b"retried-pkl"
