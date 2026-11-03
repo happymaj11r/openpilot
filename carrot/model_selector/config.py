@@ -21,6 +21,8 @@ RECOMPILE_FAILED_MARKER_NAME = ".recompile_failed"
 # 올려줄 필요가 없다. 컴파일 산출물(pkl) 호환성을 결정하는 경로만 나열할 것.
 _COMPILE_ENV_PATHS = (
     "tinygrad_repo",
+    # Gen C 엔진 디렉터리 전체(벤더 tinygrad + 런타임 + 컴파일 래퍼)를 트리 해시 하나로 반영.
+    "carrot/model_selector/genc",
     "carrot/model_selector/config.py",
     "carrot/model_selector/installer.py",
     "carrot/model_selector/compile_legacy_warp.py",
@@ -128,6 +130,13 @@ OFF_POLICY_BASE = "driving_off_policy"
 # upstream modeld engine loads directly.
 SUPERCOMBO_BASE = "driving_supercombo"
 SUPERCOMBO_PKL_NAME = "driving_tinygrad.pkl"
+
+# Gen C (comma master state-queue supercombo, `new_img` + `state_*_q`): compiled by
+# the vendored tinygrad under carrot/model_selector/genc/ into a model JIT pkl plus
+# one warp JIT pkl per camera resolution, run by carrot/model_selector/genc_modeld.py.
+GENC_PKL_NAME = "driving_genc_tinygrad.pkl"
+GENC_WARP_PKL_FMT = "driving_genc_warp_{w}x{h}_tinygrad.pkl"
+GENC_METADATA_NAME = "genc_metadata.json"
 
 # Env var honored by openpilot/selfdrive/modeld/helpers.py::modeld_pkl_path() to load
 # the unified pkl from a custom directory instead of the built-in models dir.

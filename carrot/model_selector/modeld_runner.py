@@ -2,6 +2,9 @@
 
 Decides at startup which engine serves the driving model:
 
+* `/data/models` holds a Gen C artifact set (driving_genc_tinygrad.pkl + warps +
+  genc_metadata.json)
+    → `genc_modeld.main()` (own engine on the vendored tinygrad in genc/)
 * `/data/models` holds a unified supercombo pkl (new architecture)
     → upstream `modeld.main()` with `MODELD_MODELS_DIR=/data/models` so
       `helpers.modeld_pkl_path()` loads the custom pkl (engine code unchanged)
@@ -43,7 +46,7 @@ from .config import (
     PARAM_DRIVING_MODEL_NAME,
     model_compile_env_is_current,
 )
-from .validator import describe, is_valid_legacy_model_dir, is_valid_supercombo_model_dir
+from .validator import describe, is_valid_genc_model_dir, is_valid_legacy_model_dir, is_valid_supercombo_model_dir
 
 STATUS_FILE = "/data/model_selector_status"
 QUARANTINE_DIR = Path("/data/models_quarantined")
@@ -104,11 +107,12 @@ def _quarantine_custom_model() -> None:
 
 
 def _select_engine() -> str:
-    """Returns one of: 'upstream_custom', 'carrot_legacy', 'upstream_default'."""
+    """Returns one of: 'genc_custom', 'upstream_custom', 'carrot_legacy', 'upstream_default'."""
     desc = describe(CUSTOM_MODELS_DIR)
+    has_genc = is_valid_genc_model_dir(CUSTOM_MODELS_DIR)
     has_supercombo = is_valid_supercombo_model_dir(CUSTOM_MODELS_DIR)
     has_legacy = is_valid_legacy_model_dir(CUSTOM_MODELS_DIR)
-    if (has_supercombo or has_legacy) and not model_compile_env_is_current(CUSTOM_MODELS_DIR):
+    if (has_genc or has_supercombo or has_legacy) and not model_compile_env_is_current(CUSTOM_MODELS_DIR):
         # Never unpickle an artifact produced by another tinygrad generation.
         # boot_compile has already tried an atomic rebuild from the preserved
         # ONNX. If that failed, keep the custom files for a future compiler
@@ -116,6 +120,9 @@ def _select_engine() -> str:
         engine, status = "upstream_default", "upstream_modeld"
         desc = f"stale compile environment; {desc}"
         msg = f"[MODEL_SELECTOR] custom model needs recompile; running built-in default — {desc}"
+    elif has_genc:
+        engine, status = "genc_custom", "genc_modeld"
+        msg = f"[MODEL_SELECTOR] running genc_modeld (custom Gen C supercombo) — {desc}"
     elif has_supercombo:
         engine, status = "upstream_custom", "upstream_modeld_custom"
         msg = f"[MODEL_SELECTOR] running upstream modeld (custom supercombo) — {desc}"
@@ -176,7 +183,12 @@ def main() -> None:
     args, _ = parser.parse_known_args()
 
     engine = _arm_crash_loop_breaker(_select_engine())
-    if engine == "carrot_legacy":
+    if engine == "genc_custom":
+        # genc_modeld activates the vendored tinygrad at import; nothing above
+        # this line may import the system tinygrad.
+        from . import genc_modeld
+        genc_modeld.main(demo=args.demo)
+    elif engine == "carrot_legacy":
         from openpilot.carrot.model_selector import carrot_modeld
         carrot_modeld.main(demo=args.demo)
     else:

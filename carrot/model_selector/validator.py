@@ -12,7 +12,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .config import SUPERCOMBO_PKL_NAME
+from .config import GENC_METADATA_NAME, GENC_PKL_NAME, GENC_WARP_PKL_FMT, SUPERCOMBO_PKL_NAME
+
+# Camera resolutions the Gen C installer compiles warps for (tici/tizi, mici).
+GENC_CAMERA_CONFIGS = ((1928, 1208), (1344, 760))
+
+
+def _nonempty(path: Path) -> bool:
+    return path.exists() and path.stat().st_size > 0
 
 
 def _pair_exists(base: Path, stem: str) -> bool:
@@ -42,6 +49,17 @@ def has_supercombo(base: Path) -> bool:
     return pkl.exists() and pkl.stat().st_size > 0
 
 
+def genc_warp_pkl_names() -> tuple[str, ...]:
+    return tuple(GENC_WARP_PKL_FMT.format(w=w, h=h) for w, h in GENC_CAMERA_CONFIGS)
+
+
+def has_genc(base: Path) -> bool:
+    """Gen C artifact set: model JIT pkl + a warp JIT pkl per camera + metadata json."""
+    if not _nonempty(base / GENC_PKL_NAME) or not _nonempty(base / GENC_METADATA_NAME):
+        return False
+    return all(_nonempty(base / name) for name in genc_warp_pkl_names())
+
+
 def is_valid_legacy_model_dir(base: Path) -> bool:
     if not base.exists() or not base.is_dir():
         return False
@@ -54,14 +72,22 @@ def is_valid_supercombo_model_dir(base: Path) -> bool:
     return has_supercombo(base)
 
 
+def is_valid_genc_model_dir(base: Path) -> bool:
+    if not base.exists() or not base.is_dir():
+        return False
+    return has_genc(base)
+
+
 def is_valid_model_dir(base: Path) -> bool:
-    return is_valid_supercombo_model_dir(base) or is_valid_legacy_model_dir(base)
+    return is_valid_genc_model_dir(base) or is_valid_supercombo_model_dir(base) or is_valid_legacy_model_dir(base)
 
 
 def describe(base: Path) -> str:
     """Human-readable status string for logs / API responses."""
     if not base.exists():
         return f"{base}: missing"
+    if has_genc(base):
+        return f"{base}: genc"
     if has_supercombo(base):
         return f"{base}: supercombo"
     parts = []

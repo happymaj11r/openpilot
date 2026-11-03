@@ -23,14 +23,34 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 MODELD_DIR = REPO_ROOT / "openpilot" / "selfdrive" / "modeld"
+SELECTOR_DIR = REPO_ROOT / "carrot" / "model_selector"
+GENC_DIR = SELECTOR_DIR / "genc"
+GENC_TINYGRAD_DIR = GENC_DIR / "tinygrad_repo"
 
 # installer.py 가 subprocess 로 실행하는 스크립트들 (저장소 상대 경로 계약)
 REQUIRED_SCRIPTS = (
     MODELD_DIR / "get_model_metadata.py",
     MODELD_DIR / "compile_modeld.py",
     REPO_ROOT / "tinygrad_repo" / "examples" / "openpilot" / "compile3.py",
-    REPO_ROOT / "carrot" / "model_selector" / "compile_legacy_warp.py",
+    SELECTOR_DIR / "compile_legacy_warp.py",
+    # Gen C: 벤더 tinygrad 로 실행하는 컴파일/프로브 스크립트
+    GENC_DIR / "onnx_io.py",
+    GENC_TINYGRAD_DIR / "examples" / "openpilot" / "compile_onnx.py",
+    GENC_TINYGRAD_DIR / "examples" / "openpilot" / "compile_warp.py",
+    GENC_TINYGRAD_DIR / "examples" / "openpilot" / "helpers.py",
+    GENC_TINYGRAD_DIR / "PIN",
 )
+
+# genc/runtime.py · genc/compile.py 가 벤더 tinygrad 에서 쓰는 API (파일: 정의 문자열)
+GENC_VENDOR_API = {
+    "tinygrad/engine/realize.py": ("def lower_and_compile", "def compile_linear"),
+    "tinygrad/engine/jit.py": ("class CapturedJit",),
+    "tinygrad/uop/ops.py": ("def from_buffer",),
+    "tinygrad/nn/onnx.py": ("class OnnxPBParser", "def _parse_ValueInfoProto", "def _parse_StringStringEntryProto"),
+    "examples/openpilot/helpers.py": ("def load_pickle", "out_of_band"),
+    "examples/openpilot/compile_onnx.py": ("--out-of-band", "'input_specs'", "'output_specs'"),
+    "examples/openpilot/compile_warp.py": ("--layout", "'yuv420'", "--frames", "'input_specs'"),
+}
 
 # installer._compile_supercombo 가 조립하는 compile_modeld CLI 인자 계약
 REQUIRED_CLI_FLAGS = ("--model-size", "--camera-resolutions", "--onnx", "--output", "--frame-skip")
@@ -51,6 +71,7 @@ REQUIRED_MODEL_CONSTANTS = ("MODEL_RUN_FREQ", "MODEL_CONTEXT_FREQ", "DESIRE_LEN"
 
 REQUIRED_COMPILE_ENV_PATHS = {
     "tinygrad_repo",
+    "carrot/model_selector/genc",
     "carrot/model_selector/config.py",
     "carrot/model_selector/installer.py",
     "carrot/model_selector/compile_legacy_warp.py",
@@ -220,9 +241,57 @@ def check_modeld_mirror() -> str | None:
     if stale:
         return ("마지막 미러 리뷰 이후 변경됨: " + ", ".join(stale)
                 + " — upstream_baseline/ 스냅샷과 diff 해서 carrot_modeld.py /"
-                  " carrot_parse_model_outputs.py 에 필요한 로직을 이식한 뒤"
+                  " carrot_parse_model_outputs.py / genc_modeld.py 에 필요한 로직을 이식한 뒤"
                   " `check_contracts.py --sync-baselines` 로 스냅샷을 갱신할 것")
     return None
+
+
+def check_genc_engine() -> str | None:
+    """Gen C 엔진: 벤더 tinygrad 핀·API, 설치/실행 분기 배선, 셀렉터 버전."""
+    problems = []
+    pin_file = GENC_TINYGRAD_DIR / "PIN"
+    pin = pin_file.read_text().split()[0] if pin_file.is_file() else ""
+    if not re.fullmatch(r"[0-9a-f]{40}", pin):
+        problems.append("genc/tinygrad_repo/PIN 이 40자리 커밋 해시로 시작하지 않음")
+    for rel, needles in GENC_VENDOR_API.items():
+        path = GENC_TINYGRAD_DIR / rel
+        if not path.is_file():
+            problems.append(f"벤더 tinygrad 파일 없음: {rel}")
+            continue
+        src = path.read_text()
+        missing = [n for n in needles if n not in src]
+        if missing:
+            problems.append(f"{rel}: {missing} 없음 (runtime/compile 포팅 재검토)")
+
+    # 엔진 두 벌이 한 프로세스에 섞이면 안 된다: genc 런타임은 벤더 활성화를 먼저 하고,
+    # upstream modeld(시스템 tinygrad)를 import 하지 않는다.
+    runtime = (GENC_DIR / "runtime.py").read_text()
+    if "activate_tinygrad()" not in runtime.split("from tinygrad")[0]:
+        problems.append("genc/runtime.py 가 tinygrad import 전에 activate_tinygrad() 를 호출하지 않음")
+    engine = (SELECTOR_DIR / "genc_modeld.py").read_text()
+    if "from .genc.runtime import ModelState" not in engine.split("import openpilot.cereal")[0]:
+        problems.append("genc_modeld.py 첫 import 가 genc.runtime(벤더 활성화)이 아님")
+    if re.search(r"^\s*from openpilot\.selfdrive\.modeld\.modeld import", engine, re.M):
+        problems.append("genc_modeld.py 가 upstream modeld.py(시스템 tinygrad)를 import 함")
+    for name in ("get_lat_smooth_seconds_dynamic", "get_action_from_model"):
+        if _func_params(MODELD_DIR / "modeld.py", name) != _func_params(SELECTOR_DIR / "genc_modeld.py", name):
+            problems.append(f"{name} 시그니처가 upstream modeld.py 와 다름")
+
+    installer = (SELECTOR_DIR / "installer.py").read_text()
+    if "_compile_supercombo_by_generation(MODELS_TMP_DIR, env)" not in installer:
+        problems.append("installer.compile_pending 이 세대 분기(_compile_supercombo_by_generation)를 거치지 않음")
+    runner = (SELECTOR_DIR / "modeld_runner.py").read_text()
+    if "is_valid_genc_model_dir" not in runner or '"genc_custom"' not in runner:
+        problems.append("modeld_runner 에 genc 엔진 분기 없음")
+    validator = (SELECTOR_DIR / "validator.py").read_text()
+    if "def has_genc" not in validator or "is_valid_genc_model_dir(base) or" not in validator:
+        problems.append("validator.is_valid_model_dir 가 Gen C 산출물 세트를 인식하지 않음")
+
+    keys = (SELECTOR_DIR / "keys.py").read_text()
+    m = re.search(r"^MODEL_SELECTOR_VERSION\s*=\s*(\d+)", keys, re.M)
+    if not m or int(m.group(1)) < 5:
+        problems.append("MODEL_SELECTOR_VERSION < 5 (Gen C 항목은 manifest minimum_selector_version 5 로 게이트)")
+    return "; ".join(problems) if problems else None
 
 
 def sync_baselines() -> None:
@@ -261,6 +330,7 @@ CHECKS = (
     ("model-constants", check_model_constants),
     ("wiring", check_wiring),
     ("modeld-mirror", check_modeld_mirror),
+    ("genc-engine", check_genc_engine),
 )
 
 

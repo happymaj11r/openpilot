@@ -39,7 +39,10 @@ from .config import (
     VISION_BASE,
     compile_env_tag,
 )
-from .validator import is_valid_model_dir
+from .genc import TINYGRAD_PIN as GENC_TINYGRAD_PIN
+from .genc import compile as genc_compile
+from .genc.generation import describe_inputs, detect_generation
+from .validator import GENC_CAMERA_CONFIGS, is_valid_model_dir
 
 
 METADATA_SCRIPT = OPENPILOT_ROOT / "openpilot" / "selfdrive" / "modeld" / "get_model_metadata.py"
@@ -246,6 +249,35 @@ def _compile_supercombo(tmp_dir: Path, env: dict[str, str]) -> None:
         raise InstallError(f"compile_modeld produced no output at {output}")
 
 
+def _compile_supercombo_by_generation(tmp_dir: Path, env: dict[str, str]) -> None:
+    """Route a single-onnx model to the engine its ONNX I/O names belong to.
+
+    Gen A (queues outside the ONNX) → upstream compile_modeld pipeline.
+    Gen C (comma master state-queue model) → vendored-tinygrad pipeline in genc/.
+    Anything else (e.g. the Sep 2026 Gen B intermediate) is rejected here, so an
+    incompatible download never reaches modeld.
+    """
+    onnx = tmp_dir / f"{SUPERCOMBO_BASE}.onnx"
+    try:
+        io = genc_compile.probe_onnx_io(onnx, tmp_dir, env, _run)
+    except InstallError as e:
+        raise InstallError(f"cannot read supercombo graph I/O: {e}") from e
+    inputs, outputs = io.get("inputs") or {}, io.get("outputs") or {}
+    generation = detect_generation(inputs, outputs)
+    if generation == "C":
+        cloudlog.warning(f"model_selector: Gen C supercombo detected (inputs: {describe_inputs(inputs)}) — "
+                         + f"compiling with vendored tinygrad {GENC_TINYGRAD_PIN[:8]}")
+        try:
+            genc_compile.compile_genc(tmp_dir, onnx, env, GENC_CAMERA_CONFIGS, _run, io=io)
+        except genc_compile.GencCompileError as e:
+            raise InstallError(str(e)) from e
+    elif generation == "A":
+        _compile_supercombo(tmp_dir, env)
+    else:
+        raise InstallError("unsupported supercombo generation — inputs: "
+                           + f"{describe_inputs(inputs)}; outputs: {describe_inputs(outputs)}")
+
+
 def _compile_legacy_warp_pkls(tmp_dir: Path, env: dict[str, str]) -> None:
     model_w, model_h = _model_input_size(tmp_dir)
     for cam_w, cam_h in CAMERA_CONFIGS:
@@ -296,6 +328,9 @@ def compile_pending() -> None:
       * validate ONNX files in /data/models_tmp
       * new architecture: driving_supercombo.onnx → unified driving_tinygrad.pkl
         (compile_modeld bundles metadata + model JIT + warp JITs)
+      * Gen C (comma master state-queue supercombo): driving_supercombo.onnx →
+        driving_genc_tinygrad.pkl + driving_genc_warp_{w}x{h}_tinygrad.pkl +
+        genc_metadata.json via the vendored tinygrad in genc/
       * legacy: generate metadata.pkl + tinygrad.pkl per model + warp pkls
       * atomic swap tmp → /data/models
       * write DrivingModelName, clear PendingModelName
@@ -330,7 +365,7 @@ def compile_pending() -> None:
 
     try:
         if supercombo.exists():
-            _compile_supercombo(MODELS_TMP_DIR, env)
+            _compile_supercombo_by_generation(MODELS_TMP_DIR, env)
         else:
             bases = _bases_to_compile(MODELS_TMP_DIR)
             cloudlog.warning(f"model_selector: compiling {bases}")
