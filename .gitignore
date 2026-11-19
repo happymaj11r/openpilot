@@ -115,5 +115,8 @@ Pipfile
 docs/MODEL_SELECTOR_*.md
 docs/TOSS_LOG_SERVER_SPEC.md
 
+# Extracted internal policy runtime, reproduced from the verified source archive.
+openpilot/selfdrive/modeld/models/.cheddar-runtime/
+
 # Local Windows native CPU test builds
 *.pyd
