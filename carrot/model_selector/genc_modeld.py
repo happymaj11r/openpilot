@@ -40,6 +40,7 @@ from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.common.transformations.model import get_warp_matrix
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.selfdrive.controls.lib.desire_lib.boundary_observer import BoundaryObserver
+from openpilot.selfdrive.controls.lib.desire_lib.tesla_turn import turn_signal_context
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, smooth_value, get_curvature_from_plan
 from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_driving_model_data, fill_pose_msg, PublishState
 from openpilot.selfdrive.modeld.camera_gap import CameraGapTrace
@@ -150,8 +151,8 @@ def main(demo=False):
 
   # messaging
   pm = PubMaster(["modelV2", "drivingModelData", "cameraOdometry"])
-  sm = SubMaster(["deviceState", "carState", "roadCameraState", "liveCalibration", "driverMonitoringState", "carControl", "selfdriveState",
-                  "liveDelay", "carrotMan", "radarState", "navInstructionCarrot", "navRoute"])
+  sm = SubMaster(["deviceState", "carState", "roadCameraState", "liveCalibration", "driverMonitoringState", "carControl",
+                  "selfdriveState", "livePose", "liveDelay", "carrotMan", "radarState", "navInstructionCarrot", "navRoute"])
 
   publish_state = PublishState()
 
@@ -175,8 +176,14 @@ def main(demo=False):
   prev_action = log.ModelDataV2.Action()
 
   from opendbc.car.tesla.values import TeslaFlags
-  DH = DesireHelper(tesla_auto_signals=CP.brand == "tesla" and bool(CP.flags & TeslaFlags.AUTO_TURN_SIGNALS),
-                    boundary_indicator_supported=CP.carFingerprint == 'HYUNDAI_IONIQ_5_PE')
+  from opendbc.car.hyundai.values import HyundaiSafetyFlags
+  from openpilot.selfdrive.car.voice_indicator import native_indicator
+  DH = DesireHelper(fingerprint=CP.carFingerprint, native_voice_signal=native_indicator(CP) is not None,
+                    tesla_auto_signals=CP.brand == "tesla" and bool(CP.flags & TeslaFlags.AUTO_TURN_SIGNALS),
+                    boundary_indicator_supported=not CP.passive,
+                    # the same gate as carcontroller.blinker_control: the flag interface.py sets for a Kick-capable car
+                    kick_supported=CP.brand == 'hyundai' and not CP.passive and
+                                   any(cfg.safetyParam & HyundaiSafetyFlags.CANFD_BLINKER_KICK for cfg in CP.safetyConfigs))
   boundary_observer = BoundaryObserver(cloudlog.event) if DH.boundary_indicator_supported else None
   nav_input = MapInput()
 
@@ -296,8 +303,24 @@ def main(demo=False):
     indicator_valid = modelv2_send.valid and all(
       sm.valid[k] and sm.alive[k] and 0 <= indicator_now-sm.recv_time[k] < .35
       for k in ('carState', 'carControl'))
+    turn_hold_allowed, turn_pose = False, None
+    pose = sm['livePose']
+    indicator_yaw_rate = (pose.angularVelocityDevice.z if sm.valid['livePose'] and sm.alive['livePose'] and
+                          0 <= indicator_now-sm.recv_time['livePose'] < .2 and pose.inputsOK and pose.sensorsOK and
+                          0 <= time.clock_gettime_ns(getattr(time, "CLOCK_BOOTTIME", time.CLOCK_MONOTONIC)) -
+                          sm.logMonoTime['livePose'] < 200_000_000 and
+                          pose.posenetOK and pose.angularVelocityDevice.valid else None)
+    if DH.tesla_auto_signals:
+      turn_hold_allowed, turn_pose = turn_signal_context(sm, sm['carState'], indicator_now,
+        time.clock_gettime_ns(getattr(time, "CLOCK_BOOTTIME", time.CLOCK_MONOTONIC)),
+        not sm['carControl'].latActive and params.get_bool("AlwaysLateral"))
+      turn_hold_allowed &= indicator_valid
     DH.update(sm['carState'], modelv2_send.modelV2, sm['carControl'].latActive, lane_change_prob, sm['carrotMan'], sm['radarState'],
-              indicator_valid=indicator_valid, indicator_curvature=sm['carControl'].actuators.curvature)
+              indicator_valid=indicator_valid, indicator_curvature=sm['carControl'].actuators.curvature,
+              indicator_yaw_rate=indicator_yaw_rate,
+              assistant_valid=indicator_valid and sm.valid['radarState'] and sm.alive['radarState'] and
+              0 <= indicator_now-sm.recv_time['radarState'] < .35,
+              turn_hold_allowed=turn_hold_allowed, turn_pose=turn_pose)
     modelv2_send.modelV2.meta.laneChangeState = DH.lane_change_state
     modelv2_send.modelV2.meta.laneChangeDirection = DH.lane_change_direction
     modelv2_send.modelV2.meta.desireLog = DH.desireLog #carrot
@@ -305,6 +328,8 @@ def main(demo=False):
     modelv2_send.modelV2.meta.leverTurn = DH.lever_turn
     modelv2_send.modelV2.meta.autoTurnSignal = DH.auto_turn_signal
     modelv2_send.modelV2.meta.autoTurnSignalLaneChange = DH.auto_turn_signal_lane_change
+    modelv2_send.modelV2.meta.assistantLaneSignalId = DH.assistant_lane.signal_id
+    modelv2_send.modelV2.meta.assistantLaneSignalRoute = DH.assistant_lane.signal_route
     modelv2_send.modelV2.meta.autoTurnSignalDirection = DH.auto_signal_direction
     modelv2_send.modelV2.meta.autoTurnSignalRequestId = DH.auto_signal_request_id
     modelv2_send.modelV2.meta.manualLaneIndicator = DH.boundary_indicator.request_direction
@@ -320,6 +345,8 @@ def main(demo=False):
       preparation = None
     if DH.boundary_indicator_enabled and DH.boundary_indicator.episode:
       preparation = (DH.boundary_indicator.episode['direction'], 'manual')
+    if DH.manual_turn_indicator_enabled and DH.model_indicator.manual_turn.candidate:
+      preparation = DH.model_indicator.manual_turn.candidate
     modelv2_send.modelV2.meta.indicatorPrepareDirection = preparation[0] if preparation and not observation else 0
     modelv2_send.modelV2.meta.indicatorPrepareSource = preparation[1] if preparation and not observation else ''
     if boundary_observer is not None:
