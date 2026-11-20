@@ -246,6 +246,56 @@ def check_modeld_mirror() -> str | None:
     return None
 
 
+# upstream modeld.py::main() 을 복사해 쓰는 엔진들. 값 = 그 엔진이 의도적으로 쓰지 않는 항목.
+MAINLOOP_MIRRORS: dict[str, dict[str, set[str]]] = {
+    "carrot_modeld.py": {"SubMaster": {"navInstructionCarrot", "navRoute"}},  # 레거시 엔진은 내비 입력이 없다
+    "genc_modeld.py": {},
+}
+
+
+def _mainloop_surface(path: Path) -> dict[str, set[str]]:
+    """main 루프가 SubMaster · DesireHelper · modelV2.meta 와 맞닿는 표면을 AST 로 추출."""
+    surface: dict[str, set[str]] = {"SubMaster": set(), "DesireHelper": set(), "DH.update": set(), "DH.attrs": set(), "meta": set()}
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.Call):
+            fn = node.func
+            if isinstance(fn, ast.Name) and fn.id == "DesireHelper":
+                surface["DesireHelper"] |= {k.arg for k in node.keywords if k.arg}
+            elif isinstance(fn, ast.Name) and fn.id == "SubMaster" and node.args and isinstance(node.args[0], ast.List):
+                surface["SubMaster"] |= {e.value for e in node.args[0].elts
+                                         if isinstance(e, ast.Constant) and isinstance(e.value, str)}
+            elif isinstance(fn, ast.Attribute) and fn.attr == "update" and isinstance(fn.value, ast.Name) and fn.value.id == "DH":
+                surface["DH.update"] |= {k.arg for k in node.keywords if k.arg}
+        elif isinstance(node, ast.Attribute):
+            if isinstance(node.value, ast.Name) and node.value.id == "DH":
+                surface["DH.attrs"].add(node.attr)
+            elif (isinstance(node.ctx, ast.Store) and isinstance(node.value, ast.Attribute) and node.value.attr == "meta"
+                  and isinstance(node.value.value, ast.Attribute) and node.value.value.attr == "modelV2"):
+                surface["meta"].add(node.attr)
+    return surface
+
+
+def check_mainloop_parity() -> str | None:
+    """미러 엔진(carrot_modeld / genc_modeld)이 upstream main() 의 호출 표면을 빠뜨리지 않았는지.
+
+    modeld-mirror 는 'upstream 이 바뀌었다'만 알린다. 이 검사는 이식이 실제로 각 엔진에
+    들어갔는지(구독 서비스, DesireHelper 인자·속성, modelV2.meta 필드)를 정적으로 대조한다.
+    """
+    upstream = _mainloop_surface(MODELD_DIR / "modeld.py")
+    if not all(upstream[kind] for kind in ("SubMaster", "DesireHelper", "DH.update", "meta")):
+        return "upstream modeld.py 에서 main() 호출 표면을 찾지 못함 — 이 검사를 새 구조에 맞게 고칠 것"
+    problems = []
+    for name, allowed in MAINLOOP_MIRRORS.items():
+        mirror = _mainloop_surface(SELECTOR_DIR / name)
+        for kind, expected in upstream.items():
+            missing = sorted(expected - mirror[kind] - allowed.get(kind, set()))
+            if missing:
+                problems.append(f"{name} {kind}: {missing} 없음")
+    if problems:
+        return "; ".join(problems) + " — upstream modeld.py::main() 의 해당 변경을 미러 엔진에 이식할 것"
+    return None
+
+
 def check_genc_engine() -> str | None:
     """Gen C 엔진: 벤더 tinygrad 핀·API, 설치/실행 분기 배선, 셀렉터 버전."""
     problems = []
@@ -330,6 +380,7 @@ CHECKS = (
     ("model-constants", check_model_constants),
     ("wiring", check_wiring),
     ("modeld-mirror", check_modeld_mirror),
+    ("mainloop-parity", check_mainloop_parity),
     ("genc-engine", check_genc_engine),
 )
 

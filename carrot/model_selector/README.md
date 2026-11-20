@@ -7,6 +7,8 @@ Carrot 파일럿 전용 주행 모델 다운로드/설치/적용 모듈. c3x·c4
 
 1. **엔진 분리 + 신구조는 upstream 엔진 재사용**
    - 기본 모델 (`openpilot/selfdrive/modeld/models/`) → **upstream `openpilot/selfdrive/modeld/modeld.py` 가 그대로 담당**
+     (2026-11-19~ 내장 기본은 Cheddar(Gen C). upstream `ModelState.__new__` 가 `MODELD_MODELS_DIR` 이 없을 때만 자체 Cheddar 워커를
+     고르므로 셀렉터 커스텀 모델은 그 워커를 타지 않는다 — 워커는 Cheddar 한 모델의 sha·큐 크기에 고정돼 있어 재사용 불가)
    - 커스텀 **신모델(supercombo, lebowski 구조)** (`/data/models/driving_tinygrad.pkl`)
      → **upstream `modeld.py` 를 그대로 재사용** — `MODELD_MODELS_DIR=/data/models` env 만 설정
      (`openpilot/selfdrive/modeld/helpers.py::modeld_pkl_path()` 가 env 를 읽어 경로 전환, monkey-patch 없음)
@@ -24,6 +26,9 @@ Carrot 파일럿 전용 주행 모델 다운로드/설치/적용 모듈. c3x·c4
    | A (2026-08, Lebowski/RDF/TSF…) | `img, big_img, desire_pulse, traffic_convention, action_t, features_buffer` | upstream modeld + `compile_modeld.py` |
    | B (2026-09 중간형) | `warped`/`new_img` + `state_big_img_q`, `state_prev_feat`, … | **미지원** — 설치 단계에서 InstallError |
    | C (2026-10+, comma master) | `new_img, desire, traffic_convention, action_t, state_img_q, state_desire_q, state_feat_q` (+ `next_state_*` 출력) | `genc_modeld` + 벤더 tinygrad `compile_onnx.py`/`compile_warp.py` |
+
+   state queue 길이는 모델마다 다르다 (예: SSH/OMHv3 `state_desire_q[100]`·`state_feat_q[96]`, Cheddar `[132]`·`[128]`, 출력 2576↔2580).
+   세대는 입력명으로만 판정하고 shape 은 모델에서 읽는다 — 길이를 상수로 고정하지 말 것.
 
 2. **upstream 파일 최소 침습** (각 1~3줄)
    - `openpilot/system/manager/process_config.py` — modeld 엔트리를 `openpilot.carrot.model_selector.modeld_runner` 로 교체
@@ -234,3 +239,9 @@ upstream 커밋은 주로 자동 체리픽으로 들어오므로, 셀렉터의 �
   FAIL 로 알린다. 대응: 스냅샷과 diff → 필요한 로직을 미러에 이식(무관하면 이식
   생략) → `python3 carrot/model_selector/check_contracts.py --sync-baselines` 로
   스냅샷 갱신 → 재실행해 PASS 확인.
+- **메인 루프 이식 누락 감지** (`check_contracts.py` 의 `mainloop-parity` 검사)
+  — `modeld-mirror` 는 "upstream 이 바뀌었다"만 알리고, 이식이 엔진 두 벌(`carrot_modeld.py`,
+  `genc_modeld.py`)에 모두 들어갔는지는 보지 않는다. 이 검사는 upstream `modeld.py::main()` 의
+  호출 표면 — `SubMaster` 구독 서비스, `DesireHelper(...)`·`DH.update(...)` 키워드 인자, `DH.<속성>`
+  사용, `modelV2.meta.<필드>` 대입 — 을 AST 로 뽑아 각 미러와 대조하고, 빠진 항목을 이름으로 알려준다.
+  엔진이 의도적으로 안 쓰는 항목은 `MAINLOOP_MIRRORS` 허용 목록에만 둔다 (예: 레거시 엔진의 내비 구독).
