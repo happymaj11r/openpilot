@@ -122,7 +122,7 @@ def _select_engine() -> str:
         msg = f"[MODEL_SELECTOR] custom model needs recompile; running built-in default — {desc}"
     elif has_genc:
         engine, status = "genc_custom", "genc_modeld"
-        msg = f"[MODEL_SELECTOR] running genc_modeld (custom Gen C supercombo) — {desc}"
+        msg = f"[MODEL_SELECTOR] running genc_modeld (custom state-queue supercombo) — {desc}"
     elif has_supercombo:
         engine, status = "upstream_custom", "upstream_modeld_custom"
         msg = f"[MODEL_SELECTOR] running upstream modeld (custom supercombo) — {desc}"

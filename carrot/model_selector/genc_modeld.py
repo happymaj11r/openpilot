@@ -143,7 +143,7 @@ def main(demo=False):
     cloudlog.warning(f"connected extra cam with buffer size: {vipc_client_extra.buffer_len} ({vipc_client_extra.width} x {vipc_client_extra.height})")
 
   st = time.monotonic()
-  cloudlog.warning(f"loading Gen C model from {CUSTOM_MODELS_DIR}")
+  cloudlog.warning(f"loading state-queue (Gen B/C) model from {CUSTOM_MODELS_DIR}")
   model = ModelState(CUSTOM_MODELS_DIR, vipc_client_main.width, vipc_client_main.height)
   model.warmup()
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s (device {model.device_spec}, "

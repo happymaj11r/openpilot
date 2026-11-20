@@ -1,10 +1,20 @@
-"""Gen C runtime core: comma master `modeld.py::ModelState` (2026-11-02) ported for the
-carrot model selector.
+"""State-queue (Gen B / Gen C) runtime core: comma master `modeld.py::ModelState` (2026-11-02)
+ported for the carrot model selector.
 
 Differences from comma's class:
+  * the image input is looked up by name (`new_img`, or `warped` in the first Gen B export)
+    from genc_metadata.json; state tensors are whatever `state_*`/`next_state_*` pairs the
+    artifact declares, exactly as upstream, so Gen B's per-camera queues need no extra code
   * artifacts come from the installed custom model dir (model JIT pkl + one warp JIT pkl
     per camera + genc_metadata.json) instead of the built-in models dir
   * no chestnut/eGPU branch — the Gen C engine runs on the integrated GPU only
+  * state feedback swaps buffers instead of writing in place. comma points each
+    `next_state_*` output at the buffer of its `state_*` input, which is only right when no
+    kernel reads a state after the kernel that writes its successor — the model JIT was
+    captured with separate buffers, so tinygrad orders kernels without knowing about the
+    alias. That holds for comma's own Gen C models and fails for Gen B (pc_check: raw outputs
+    differ from the ONNX from the 4th frame on). Here every `next_state_*` keeps its own
+    buffer and the two are exchanged after each run: no copy, and no ordering assumption.
   * `run()` takes the carrot main-loop signature; `prepare_only` is accepted but ignored
     because Gen C history lives inside the ONNX (every frame is a full inference, which
     is also what comma master does)
@@ -81,6 +91,8 @@ class ModelState:
     # backend would fail at load, so always follow the artifact.
     self.device_spec = device or self.metadata.get('compile_dev') or default_device()
     self.vision_input_names = VISION_INPUT_NAMES
+    # Artifacts compiled before Gen B support carry no image_input key; they are all Gen C.
+    self.image_input = self.metadata.get('image_input') or GEN_C_IMAGE_INPUT
     self.usbgpu = False
     self.prev_desire = np.zeros(ModelConstants.DESIRE_LEN, dtype=np.float32)
     stride, y_height, uv_height, _ = get_nv12_info(cam_w, cam_h)
@@ -94,7 +106,7 @@ class ModelState:
   def _load(self, models_dir: Path, cam_w: int, cam_h: int) -> None:
     from examples.openpilot.helpers import load_pickle  # vendored tinygrad examples; see note above
     jits = load_pickle(models_dir / GENC_PKL_NAME, out_of_band=True)
-    self.model_device = jits['input_specs'][GEN_C_IMAGE_INPUT][2]
+    self.model_device = jits['input_specs'][self.image_input][2]
     self.input_shapes = {name: (tuple(shape), np.dtype(dtype)) for name, (shape, dtype, _) in jits['input_specs'].items()}
     self.state_pairs = {name: f'next_{name}' for name in self.input_shapes if f'next_{name}' in jits['metadata']['output_shapes']}
     # comma stores {name: slice} as a base64 pickle in the ONNX metadata; the ONNX was
@@ -107,11 +119,14 @@ class ModelState:
     self.run_warp.captured._linear = lower_and_compile(self.run_warp.captured._linear)
     self.run_model = jits['run']
     self.run_model.captured._linear = lower_and_compile(self.run_model.captured._linear)
+    # Every output, including each next_state_*, gets its own buffer (see the module docstring).
     self.outputs = {name: Tensor(np.zeros(shape, dtype=dtype), device=device).realize()
                     for name, (shape, dtype, device) in jits['output_specs'].items()}
     for name, next_name in self.state_pairs.items():
-      state = self.input_queues[name]
-      self.outputs[next_name] = input_view(state._buffer(), state.shape, state.dtype, 0)
+      state, next_state = self.input_queues[name], self.outputs[next_name]
+      if (state.shape, state.dtype, state.device) != (next_state.shape, next_state.dtype, next_state.device):
+        raise ValueError(f"{next_name} {next_state.shape}/{next_state.dtype}/{next_state.device} cannot be fed back as "
+                         + f"{name} {state.shape}/{state.dtype}/{state.device}")
     self.copy_outputs = compile_copy(self.outputs['outputs'].to('CPU'))
     self.parser = Parser()
 
@@ -120,7 +135,7 @@ class ModelState:
     self.input_queues = {name: Tensor(np.zeros(shape, dtype=dtype), device=self.model_device).realize()
                          for name, (shape, dtype) in self.input_shapes.items() if name in self.state_pairs}
     shapes = {'tfm': (2, 3, 3)} | {name: shape for name, (shape, _) in self.input_shapes.items()
-                                   if name not in self.state_pairs and name != GEN_C_IMAGE_INPUT}
+                                   if name not in self.state_pairs and name != self.image_input}
     npy_size = sum(round_up(math.prod(shape) * 4, 128) for shape in shapes.values())
     self.packed_input = np.zeros(npy_size + 2 * self.frame_copy_size, dtype=np.uint8)
     self.input_host = Tensor(self.packed_input, device='NPY')
@@ -154,8 +169,11 @@ class ModelState:
     self.npy['action_t'][:] = inputs['action_t']
 
     self.copy_inputs()
-    self.input_queues[GEN_C_IMAGE_INPUT] = self.run_warp(**self.warp_inputs)
+    self.input_queues[self.image_input] = self.run_warp(**self.warp_inputs)
     self.run_model(output_buffers=self.outputs, **self.input_queues)
+    # What the model just wrote is the next frame's state; the old state buffer becomes the next target.
+    for name, next_name in self.state_pairs.items():
+      self.input_queues[name], self.outputs[next_name] = self.outputs[next_name], self.input_queues[name]
     model_output = self.copy_outputs().numpy()[0]
     outputs_dict = self.parser.parse_outputs(self.slice_outputs(model_output, self.output_slices))
 

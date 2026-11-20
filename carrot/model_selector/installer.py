@@ -41,7 +41,7 @@ from .config import (
 )
 from .genc import TINYGRAD_PIN as GENC_TINYGRAD_PIN
 from .genc import compile as genc_compile
-from .genc.generation import describe_inputs, detect_generation
+from .genc.generation import STATE_QUEUE_GENERATIONS, describe_inputs, detect_generation
 from .validator import GENC_CAMERA_CONFIGS, is_valid_model_dir
 
 
@@ -253,8 +253,8 @@ def _compile_supercombo_by_generation(tmp_dir: Path, env: dict[str, str]) -> Non
     """Route a single-onnx model to the engine its ONNX I/O names belong to.
 
     Gen A (queues outside the ONNX) → upstream compile_modeld pipeline.
-    Gen C (comma master state-queue model) → vendored-tinygrad pipeline in genc/.
-    Anything else (e.g. the Sep 2026 Gen B intermediate) is rejected here, so an
+    Gen B / Gen C (state queues inside the ONNX) → vendored-tinygrad pipeline in genc/.
+    Anything else (an I/O set genc/generation.py does not list) is rejected here, so an
     incompatible download never reaches modeld.
     """
     onnx = tmp_dir / f"{SUPERCOMBO_BASE}.onnx"
@@ -264,8 +264,8 @@ def _compile_supercombo_by_generation(tmp_dir: Path, env: dict[str, str]) -> Non
         raise InstallError(f"cannot read supercombo graph I/O: {e}") from e
     inputs, outputs = io.get("inputs") or {}, io.get("outputs") or {}
     generation = detect_generation(inputs, outputs)
-    if generation == "C":
-        cloudlog.warning(f"model_selector: Gen C supercombo detected (inputs: {describe_inputs(inputs)}) — "
+    if generation in STATE_QUEUE_GENERATIONS:
+        cloudlog.warning(f"model_selector: Gen {generation} supercombo detected (inputs: {describe_inputs(inputs)}) — "
                          + f"compiling with vendored tinygrad {GENC_TINYGRAD_PIN[:8]}")
         try:
             genc_compile.compile_genc(tmp_dir, onnx, env, GENC_CAMERA_CONFIGS, _run, io=io)
@@ -328,7 +328,7 @@ def compile_pending() -> None:
       * validate ONNX files in /data/models_tmp
       * new architecture: driving_supercombo.onnx → unified driving_tinygrad.pkl
         (compile_modeld bundles metadata + model JIT + warp JITs)
-      * Gen C (comma master state-queue supercombo): driving_supercombo.onnx →
+      * Gen B / Gen C (state-queue supercombo, comma master since 2026-09): driving_supercombo.onnx →
         driving_genc_tinygrad.pkl + driving_genc_warp_{w}x{h}_tinygrad.pkl +
         genc_metadata.json via the vendored tinygrad in genc/
       * legacy: generate metadata.pkl + tinygrad.pkl per model + warp pkls

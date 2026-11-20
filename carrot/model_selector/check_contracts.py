@@ -318,6 +318,12 @@ def check_genc_engine() -> str | None:
     runtime = (GENC_DIR / "runtime.py").read_text()
     if "activate_tinygrad()" not in runtime.split("from tinygrad")[0]:
         problems.append("genc/runtime.py 가 tinygrad import 전에 activate_tinygrad() 를 호출하지 않음")
+    # state 되먹임: comma 처럼 next_state_* 출력을 state_* 입력 버퍼에 겹쳐 쓰면 Gen B 에서 출력이 틀어진다
+    # (pc_check 참조 비교로 확인). 출력 버퍼를 따로 두고 매 프레임 교환하는 방식을 유지해야 한다.
+    if re.search(r"self\.outputs\[next_name\]\s*=\s*input_view\(", runtime):
+        problems.append("genc/runtime.py 가 next_state 출력을 state 입력 버퍼에 겹쳐 씀 (in-place) — 버퍼 교환 방식으로 되돌릴 것")
+    if "self.input_queues[name], self.outputs[next_name] = self.outputs[next_name], self.input_queues[name]" not in runtime:
+        problems.append("genc/runtime.py 에 state/next_state 버퍼 교환이 없음")
     engine = (SELECTOR_DIR / "genc_modeld.py").read_text()
     if "from .genc.runtime import ModelState" not in engine.split("import openpilot.cereal")[0]:
         problems.append("genc_modeld.py 첫 import 가 genc.runtime(벤더 활성화)이 아님")

@@ -1,4 +1,4 @@
-"""Gen C compile wrapper: command assembly, I/O validation, orchestration (no real compile)."""
+"""State-queue (Gen B / Gen C) compile wrapper: command assembly, I/O validation, orchestration (no real compile)."""
 from __future__ import annotations
 
 import copy
@@ -35,13 +35,51 @@ SSHV4_IO = {
 }
 
 
-def test_sshv4_io_validates():
-  validate_genc_io(SSHV4_IO)
+# "Onnx Model History" v1 (Gen B): names/shapes read from the catalog ONNX. Its slice names and order are
+# SSHv4's without traffic_units, and outputs is 2576 wide, so the offsets are the same.
+OMH_V1_IO = {
+  "inputs": {
+    "warped": [2, 6, 128, 256], "state_img_q": [5, 6, 128, 256], "state_big_img_q": [5, 6, 128, 256], "desire": [8],
+    "state_desire_q": [100, 1, 8], "state_prev_feat": [1, 512], "state_feat_q": [96, 1, 512],
+    "traffic_convention": [1, 2], "action_t": [1, 2],
+  },
+  "outputs": {
+    "outputs": [1, 2576], "next_state_img_q": [5, 6, 128, 256], "next_state_big_img_q": [5, 6, 128, 256],
+    "next_state_desire_q": [100, 1, 8], "next_state_feat_q": [96, 1, 512], "next_state_prev_feat": [1, 512],
+  },
+  "metadata": {"model_checkpoint": "6a7d09ad"},
+  "output_slices": {k: v for k, v in SSHV4_IO["output_slices"].items() if k != "traffic_units"},
+}
+
+
+def test_sshv4_io_validates_as_gen_c():
+  assert validate_genc_io(SSHV4_IO) == "C"
+
+
+def test_omh_v1_io_validates_as_gen_b():
+  assert validate_genc_io(OMH_V1_IO) == "B"
+  renamed = copy.deepcopy(OMH_V1_IO)
+  renamed["inputs"]["new_img"] = renamed["inputs"].pop("warped")  # "Onnx Model Historyv2"
+  assert validate_genc_io(renamed) == "B"
 
 
 @pytest.mark.parametrize("mutate, needle", [
-  (lambda io: io["inputs"].pop("desire"), "not a Gen C"),
-  (lambda io: io["outputs"].pop("next_state_feat_q"), "not a Gen C"),
+  (lambda io: io["inputs"].__setitem__("warped", [1, 12, 128, 256]), "warped shape"),
+  (lambda io: io["outputs"].__setitem__("next_state_prev_feat", [1, 256]), "next_state_prev_feat shape"),
+  (lambda io: io["outputs"].__setitem__("next_state_big_img_q", [4, 6, 128, 256]), "next_state_big_img_q shape"),
+  (lambda io: io["inputs"].pop("state_prev_feat"), "not a state-queue"),
+  (lambda io: io["output_slices"].pop("plan"), "output_slices missing"),
+])
+def test_invalid_gen_b_io_is_rejected(mutate, needle):
+  io = copy.deepcopy(OMH_V1_IO)
+  mutate(io)
+  with pytest.raises(GencCompileError, match=needle):
+    validate_genc_io(io)
+
+
+@pytest.mark.parametrize("mutate, needle", [
+  (lambda io: io["inputs"].pop("desire"), "not a state-queue"),
+  (lambda io: io["outputs"].pop("next_state_feat_q"), "not a state-queue"),
   (lambda io: io["inputs"].__setitem__("new_img", [2, 6, 64, 128]), "new_img shape"),
   (lambda io: io["inputs"].__setitem__("desire", [7]), "desire shape"),
   (lambda io: io["inputs"].__setitem__("action_t", [1, 3]), "action_t shape"),
@@ -110,6 +148,8 @@ def test_compile_genc_orchestration(tmp_path: Path, monkeypatch):
     assert env["DEV"] == "QCOM"
   meta = json.loads((tmp_path / GENC_METADATA_NAME).read_text())
   assert meta["generation"] == "C" and meta["cameras"] == [[1928, 1208], [1344, 760]]
+  assert meta["image_input"] == "new_img"
+  assert meta["state_inputs"] == ["state_img_q", "state_desire_q", "state_feat_q"]
   assert meta["compile_dev"] == "QCOM"
   assert meta["output_slices"]["plan"] == [1576, 2566]
   assert not (tmp_path / ".genc_onnx_io.json").exists()
@@ -132,6 +172,22 @@ def test_compile_genc_reuses_probed_io(tmp_path: Path):
   assert json.loads((tmp_path / GENC_METADATA_NAME).read_text())["compile_dev"] == "CPU:LLVM"
 
 
+def test_compile_genc_records_gen_b_layout(tmp_path: Path):
+  onnx = tmp_path / "driving_supercombo.onnx"
+  calls = []
+
+  def fake_run(cmd, env):
+    calls.append(cmd)
+    Path(cmd[cmd.index("--output") + 1] if "--output" in cmd else cmd[3]).write_bytes(b"artifact")
+
+  compile_genc(tmp_path, onnx, {"DEV": "QCOM"}, CAMS, fake_run, io=copy.deepcopy(OMH_V1_IO))
+  # same commands as Gen C: the image tensor both generations take is the same 2-camera warp output
+  assert calls == genc_compile_commands(onnx, tmp_path, CAMS)
+  meta = json.loads((tmp_path / GENC_METADATA_NAME).read_text())
+  assert meta["generation"] == "B" and meta["image_input"] == "warped"
+  assert meta["state_inputs"] == ["state_img_q", "state_big_img_q", "state_desire_q", "state_prev_feat", "state_feat_q"]
+
+
 def test_probe_onnx_io_cleans_up(tmp_path: Path):
   def fake_run(cmd, env):
     assert env["PYTHONPATH"].split(":")[0] == str(TINYGRAD_DIR)
@@ -152,7 +208,7 @@ def test_compile_genc_rejects_before_compiling(tmp_path: Path):
     calls.append(cmd)
     Path(cmd[cmd.index("--json") + 1]).write_text(json.dumps(bad))
 
-  with pytest.raises(GencCompileError, match="not a Gen C"):
+  with pytest.raises(GencCompileError, match="not a state-queue"):
     compile_genc(tmp_path, onnx, {}, CAMS, fake_run)
   assert len(calls) == 1  # only the I/O probe ran
 

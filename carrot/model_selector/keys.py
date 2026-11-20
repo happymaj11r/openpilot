@@ -13,5 +13,5 @@ MODEL_SIGNING_KEYS: dict[str, str] = {
 # Bumped when incompatible selector changes ship; manifests declare
 # `minimumSelectorVersion` and are rejected if this constant is lower.
 # v4: new-architecture (driving_supercombo.onnx) model support.
-# v5: Gen C (comma master state-queue supercombo: new_img + state_*_q) support.
+# v5: state-queue supercombo support — Gen C (comma master: new_img + state_*_q) and Gen B (the 2026-09 per-camera-queue exports).
 MODEL_SELECTOR_VERSION = 5

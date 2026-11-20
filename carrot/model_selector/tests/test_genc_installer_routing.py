@@ -1,5 +1,5 @@
 """installer routes a single-onnx model by its ONNX generation:
-Gen A → upstream compile_modeld path, Gen C → genc pipeline, anything else → InstallError."""
+Gen A → upstream compile_modeld path, Gen B / Gen C → genc pipeline, anything else → InstallError."""
 from __future__ import annotations
 
 import sys
@@ -63,7 +63,11 @@ GEN_C_IO = {"inputs": {"new_img": [2, 6, 128, 256], "desire": [8], "traffic_conv
             "output_slices": {"plan": [0, 1]}}
 GEN_B_IO = {"inputs": {n: [1] for n in ("warped", "state_img_q", "state_big_img_q", "desire", "state_desire_q",
                                         "state_prev_feat", "state_feat_q", "traffic_convention", "action_t")},
-            "outputs": {"outputs": [1, 10]}, "output_slices": {}}
+            "outputs": {n: [1] for n in ("outputs", "next_state_img_q", "next_state_big_img_q", "next_state_desire_q",
+                                         "next_state_prev_feat", "next_state_feat_q")},
+            "output_slices": {}}
+UNKNOWN_STATE_IO = {"inputs": GEN_C_IO["inputs"] | {"state_mystery_q": [4, 8]},
+                    "outputs": GEN_C_IO["outputs"] | {"next_state_mystery_q": [4, 8]}, "output_slices": {}}
 
 
 @pytest.fixture
@@ -72,7 +76,7 @@ def routed(monkeypatch):
   monkeypatch.setattr(installer, "_compile_supercombo", lambda tmp_dir, env: calls.append(("A", tmp_dir)))
 
   def fake_compile_genc(tmp_dir, onnx, env, camera_configs, run, python="python3", io=None):
-    calls.append(("C", tmp_dir, tuple(camera_configs), io))
+    calls.append(("genc", tmp_dir, tuple(camera_configs), io))
 
   monkeypatch.setattr(genc_compile, "compile_genc", fake_compile_genc)
   return calls
@@ -91,12 +95,18 @@ def test_gen_a_uses_upstream_pipeline(monkeypatch, tmp_path: Path, routed):
 def test_gen_c_uses_genc_pipeline_with_probed_io(monkeypatch, tmp_path: Path, routed):
   monkeypatch.setattr(genc_compile, "probe_onnx_io", _probe(GEN_C_IO))
   installer._compile_supercombo_by_generation(tmp_path, {"DEV": "QCOM"})
-  assert routed == [("C", tmp_path, installer.GENC_CAMERA_CONFIGS, GEN_C_IO)]
+  assert routed == [("genc", tmp_path, installer.GENC_CAMERA_CONFIGS, GEN_C_IO)]
 
 
-def test_gen_b_is_rejected_before_any_compile(monkeypatch, tmp_path: Path, routed):
+def test_gen_b_uses_genc_pipeline_with_probed_io(monkeypatch, tmp_path: Path, routed):
   monkeypatch.setattr(genc_compile, "probe_onnx_io", _probe(GEN_B_IO))
-  with pytest.raises(installer.InstallError, match="unsupported supercombo generation.*state_big_img_q"):
+  installer._compile_supercombo_by_generation(tmp_path, {"DEV": "QCOM"})
+  assert routed == [("genc", tmp_path, installer.GENC_CAMERA_CONFIGS, GEN_B_IO)]
+
+
+def test_unlisted_state_layout_is_rejected_before_any_compile(monkeypatch, tmp_path: Path, routed):
+  monkeypatch.setattr(genc_compile, "probe_onnx_io", _probe(UNKNOWN_STATE_IO))
+  with pytest.raises(installer.InstallError, match="unsupported supercombo generation.*state_mystery_q"):
     installer._compile_supercombo_by_generation(tmp_path, {"DEV": "QCOM"})
   assert routed == []
 
