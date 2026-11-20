@@ -222,3 +222,54 @@ PASS   (1344x760 카메라 경로도 PASS)
 2. `.compile_env` 경로 추가로 기존 커스텀 모델 1회 재컴파일(부팅 지연 수 분) — 기존 설계대로.
 3. Gen C 모델의 `traffic_units` 등 추가 slice 는 fill_model_msg 가 무시(안전). `plan_stds` 는 parser 가 생성하므로 동적 lat smooth 유지.
 4. 디스크: 벤더 tinygrad +19MB(저장소/기기).
+
+## 2026-11-20 재개: 최신 carrot-ms 위로 재배치 (branch `genc-support-2`)
+
+**배경.** 2026-11-19 에 carrot-wip 이 내장 기본 모델을 CD210 → Cheddar(comma #39255, Gen C)로 바꿨고 자동 체리픽으로
+carrot-ms 에 들어왔다. upstream 은 Cheddar 를 자체 워커(`cheddar_model/worker/adapter/runtime.py` + 트리 내
+`runtimes/tinygrad-ec91b74….tar.gz`)로 돌리고, 셀렉터 커스텀 모델은 `ModelState.__new__` 의 `MODELD_MODELS_DIR` 게이트로
+기존 경로를 유지한다. 내장 기본이 Gen C 가 됐으므로 셀렉터도 같은 세대를 설치할 수 있어야 한다.
+
+**한 일.**
+- `origin/carrot-ms` e1fdfafe6 위에 genc 커밋 2개를 체리픽 (충돌 없음, 기존 계약 13/13 · pytest 51 그대로 PASS).
+- 메인 루프 이식 6건: `genc_modeld.py` 는 dcdc5d88f 시점의 `modeld.py::main()` 복사본이라 그 뒤 upstream 변경
+  (livePose 구독·yaw rate·turn hold, `DesireHelper(fingerprint, native_voice_signal, kick_supported)`,
+  `DH.update` 인자 4개, `assistantLaneSignalId/Route`, manual turn preparation)이 빠져 있었다. `carrot_modeld.py` 와 같은
+  hunk 를 적용했고, 두 `main()` 의 공백 무시 diff 에는 의도된 제거(eGPU·Jetlink·shadow·prepare_only·recovery)만 남는다.
+- 새 계약 `mainloop-parity`: upstream `main()` 의 호출 표면을 AST 로 뽑아 미러 엔진 두 벌과 대조. 이식 전
+  `genc_modeld.py` 는 정확히 위 항목들로 FAIL 한다 (재발 방지). 계약 14/14 PASS, pytest 57 passed.
+
+**upstream 메인 루프 재사용 검토 → 미채택.**
+1. upstream `modeld.py` 는 import 시점에 시스템 tinygrad 를 로드한다. 벤더 tinygrad(ec91b74)와 한 프로세스에 둘 수 없다.
+2. upstream 의 Cheddar 워커는 별도 프로세스로 이를 푼다. 하지만 `CheddarAdapter`/`compile_bundle` 이 Cheddar 의 ONNX sha256,
+   checkpoint, 출력 2580, state queue 132/128 에 고정돼 있어, 다른 Gen C 모델에 쓰려면 upstream 파일을 고쳐야 한다
+   (최소 침습 원칙 위배, upstream 이 내장 모델을 바꿀 때마다 충돌).
+3. 그래서 자체 루프를 유지하고, 이식 누락은 `mainloop-parity` 로 기계적으로 잡는다.
+   upstream 이 워커를 범용화하면(sha 고정 제거) 그때 재검토한다.
+
+**PC 검증 (Hermes VM, py3.12, DEV=CPU:LLVM, `genc/pc_check.py` = 프로브 → 컴파일 → 반복 추론).**
+카탈로그에서 `minimum_selector_version 5` 로 걸린 항목 전부와 OMH v1 을 돌렸다. 카메라는 번갈아 사용.
+
+| 모델 | 크기 | 카메라 | 결과 |
+|------|------|--------|------|
+| Cheddar (내장 기본과 동일 sha `350a47ea…`) | 69.7MB | 1344x760 · 1928x1208 | PASS (컴파일 19s, plan (1,33,15), finite, 상태 큐 갱신) |
+| CH | 82.6MB | 1928x1208 | PASS |
+| CHv2 | 82.5MB | 1344x760 | PASS |
+| SSH / SSHv2 / SSHv3 / SSHv4 | 60.9MB | 번갈아 | PASS ×4 |
+| Onnx Model Historyv3 | 60.9MB | 1928x1208 | PASS |
+| Onnx Model Historyv2 | 60.9MB | — | 거부: `not a Gen C supercombo` (Gen B: `state_big_img_q`, `state_prev_feat`) |
+| Onnx Model History | 60.9MB | — | 거부: 같은 사유 (Gen B) |
+
+Cheddar 는 큐가 길다(`state_desire_q[132,1,8]`, `state_feat_q[128,1,512]`, 출력 2580, float32). 엔진은 shape 을 모델에서
+읽으므로 수정 없이 통과했다. PC 수치는 CPU 추론(230~410ms)이라 기기 성능과 무관하다.
+
+**미검증.** 기기(QCOM) 컴파일·구동, 메인 루프 실제 실행(메시징/VisionIpc 가 필요해 PC 에서는 못 돌림), 주행.
+참고로 carrot-wip 문서(`docs/cheddar_model_review_20261118.md`)는 같은 tinygrad 리비전으로 실기기에서 Cheddar 를 컴파일·구동해
+추론 약 31~34ms, 50ms 초과 0 을 기록했다 — 우리 엔진의 측정이 아니다.
+
+**남은 일.**
+1. 기기 1대 주차 상태 테스트: 이 브랜치로 전환·빌드 → `genc/device_preflight.py` → 셀렉터에서 Gen C 모델(예: CH) 설치 →
+   `/data/model_selector_status` 가 `engine=genc_modeld`, `/data/models/.load_attempts` 가 90초 뒤 사라지는지 확인.
+   브랜치 전환 시 `.compile_env` 태그가 바뀌어 기존 커스텀 모델은 부팅 때 1회 재컴파일된다.
+2. 통과 후 carrot-ms 와 `happymaj11r/carrot-wip-model_selector` 에 반영 (계약 전부 PASS 후 push).
+3. Task 11: 카탈로그에서 OMH v1/v2 → msv 99, watcher `selector_version.json` → 5, 세대 판정을 입력명 규칙으로.
