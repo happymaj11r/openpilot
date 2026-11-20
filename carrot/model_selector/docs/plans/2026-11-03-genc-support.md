@@ -301,10 +301,12 @@ Cheddar 는 큐가 길다(`state_desire_q[132,1,8]`, `state_feat_q[128,1,512]`, 
   같은 파일이고 vision checkpoint 도 같다. compile3 은 첫 출력만 반환하므로 전용 컴파일이 필요한데 얻는 것이 deep v1 과 같은 모델뿐이다.
 - 부수 발견: **DTRv6** (msv 1) 의 policy 입력 `lateral_control_params`, `prev_desired_curv` 는 레거시 엔진이 채우지 않아 항상 0 이다 (기존 동작).
 
-**카탈로그 정정 필요 (서명 manifest, 아직 안 함).**
-- `Off policyv8` msv 2 → 차단: v7 과 같은 구조인데 목록에 보인다. 설치하면 첫 추론에서 JIT 인자 불일치로 죽고 3회 뒤 내장 모델로 폴백한다 (코드 대조, 기기 미확인).
+**카탈로그 정정 (2026-11-20 적용: openpilot-models 9205170, 두 manifest 재서명).**
+- `Off policyv8` msv 2 → 99 (selector_version+1 이 아니라 99 — 셀렉터 버전이 올라가도 다시 노출되지 않게): v7 과 같은 구조인데 목록에 보인다. 설치하면 첫 추론에서 JIT 인자 불일치로 죽고 3회 뒤 내장 모델로 폴백한다 (코드 대조, 기기 미확인).
 - `Onnx Model History` (v1) msv 4 → 5: v4 셀렉터에는 보이지만 설치 단계에서 거부된다.
 - `Onnx Model Historyv2` 는 5 유지 (기존 계획의 "v1/v2 → 99" 는 폐기).
+- 적용 후 공개 manifest: 셀렉터 v4 에 보이는 항목 64, v5 기준 74. 기기 쪽 코드(`manifest._fetch_and_verify_one`)로 두 URL 모두 서명 검증 통과.
+- 막아둔 7개(Op model16 deep 5종, Off policy v3·v5)는 차단 유지로 결정 — deep 시험 계획은 취소.
 
 **한 일.**
 1. **Gen B 지원.** Gen B 는 Gen C 와 같은 계열이다 — comma #38916 의 커밋 순서가 `warped` export → `new_img` 로 개명 → state 병합(Gen C)
@@ -332,4 +334,4 @@ OMH v1·v2·v3, Cheddar 는 두 카메라 해상도(1928x1208, 1344x760) 모두,
 
 **남은 일 (위 "남은 일" 에 추가).**
 - 기기 테스트에 Gen B 하나(OMH v2) 포함.
-- 막아둔 7개는 엔진 작업이 아니라 결정 사항: deep 계열은 기기에서 하나(가장 가벼운 deepv5) 시험해 사유를 확인, Off policy v3·v5 는 차단 사유(주행 위험 판단)가 유효한지.
+- 막아둔 7개는 차단 유지 (2026-11-20 결정). 추가 작업 없음.
