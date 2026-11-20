@@ -272,4 +272,64 @@ Cheddar 는 큐가 길다(`state_desire_q[132,1,8]`, `state_feat_q[128,1,512]`, 
    `/data/model_selector_status` 가 `engine=genc_modeld`, `/data/models/.load_attempts` 가 90초 뒤 사라지는지 확인.
    브랜치 전환 시 `.compile_env` 태그가 바뀌어 기존 커스텀 모델은 부팅 때 1회 재컴파일된다.
 2. 통과 후 carrot-ms 와 `happymaj11r/carrot-wip-model_selector` 에 반영 (계약 전부 PASS 후 push).
-3. Task 11: 카탈로그에서 OMH v1/v2 → msv 99, watcher `selector_version.json` → 5, 세대 판정을 입력명 규칙으로.
+3. Task 11: watcher `selector_version.json` → 5, 세대 판정을 입력명 규칙으로. (OMH v1/v2 의 msv 는 아래 절에서 99 → 5 로 계획 변경)
+
+## 2026-11-20 (2): 카탈로그 전수 조사 + Gen B 지원 + state 되먹임 수정
+
+**배경.** "카탈로그의 모든 모델이 돌아가게" 라는 요구. 무엇이 왜 안 도는지부터 85개 전부 확인했다.
+
+**조사 방법.**
+- 배포 저장소(LXC 101 `/root/openpilot-models/models/*`)의 ONNX 에서 그래프 입출력·`output_slices`·checkpoint 를 직접 읽음.
+- 레거시(vision+policy) 세트는 `carrot_modeld.ModelState` 의 데이터 흐름(`InputQueues`, `Parser`, plan/planplus 병합,
+  `get_action_from_model`, `fill_model_msg` 가 읽는 키·shape)을 저장소의 실제 코드로 재현해 대조 — 컴파일·추론 없는 **정적** 확인.
+- state-queue 세트는 `genc/pc_check.py` 로 실제 컴파일·추론 (아래).
+
+**결과 (2026-11-20 카탈로그 85개).**
+
+| 구분 | 수 | 내용 |
+|------|----|------|
+| 지금(v4) 셀렉터에 보이는 것 | 66 | 정적 대조에서 64개 통과(실행 확인은 아님), 2개는 보이지만 안 돈다 (아래 "카탈로그 정정") |
+| 이 브랜치(v5)로 추가 | 10 | Gen C 8 (Cheddar, CH, CHv2, SSH×4, OMH v3) + Gen B 2 (OMH v1, v2) |
+| 정적 대조로는 엔진과 맞지만 일부러 막아둔 것 | 7 | Op model16 deep v1·v3·v4·v5·v6 (2026-05-23 "비호환 표시", 사유 기록 없음), Off policy v3·v5 (2026-02-28 "위험 모델로 판단") |
+| 지원 대상이 못 되는 것 | 4 | Giga, Off policy v7·v8, Op model16 deepv2 |
+
+- **Giga**: `driving_vision.onnx` 116MB (통상 20MB). 2026-07-03 기기에서 `driving model lagging / frames dropped` 로 차단. 호환이 아니라 연산량 문제.
+- **Off policy v7·v8**: policy 에만 `control_context[1,2]` 입력이 있다. comma 의 해당 커밋(db1d86b375) `modeld.py` 에도 이 입력을 채우는
+  코드가 없고, 우리와 똑같이 `off_policy_run(**self.policy_inputs)` 로 부른다 — 다음 커밋들("recomp", "update models")에서 입력이 사라진
+  중간 export 다. 무엇을 넣어야 하는지 아는 코드가 어디에도 없으므로, 0 을 넣어 "돌게" 만드는 것은 지원이 아니다.
+- **Op model16 deepv2**: vision 출력이 `outputs` 하나가 아니라 8개로 쪼개진 export (1.5시간 뒤 v3 에서 원복). on/off policy 는 deep v1 과
+  같은 파일이고 vision checkpoint 도 같다. compile3 은 첫 출력만 반환하므로 전용 컴파일이 필요한데 얻는 것이 deep v1 과 같은 모델뿐이다.
+- 부수 발견: **DTRv6** (msv 1) 의 policy 입력 `lateral_control_params`, `prev_desired_curv` 는 레거시 엔진이 채우지 않아 항상 0 이다 (기존 동작).
+
+**카탈로그 정정 필요 (서명 manifest, 아직 안 함).**
+- `Off policyv8` msv 2 → 차단: v7 과 같은 구조인데 목록에 보인다. 설치하면 첫 추론에서 JIT 인자 불일치로 죽고 3회 뒤 내장 모델로 폴백한다 (코드 대조, 기기 미확인).
+- `Onnx Model History` (v1) msv 4 → 5: v4 셀렉터에는 보이지만 설치 단계에서 거부된다.
+- `Onnx Model Historyv2` 는 5 유지 (기존 계획의 "v1/v2 → 99" 는 폐기).
+
+**한 일.**
+1. **Gen B 지원.** Gen B 는 Gen C 와 같은 계열이다 — comma #38916 의 커밋 순서가 `warped` export → `new_img` 로 개명 → state 병합(Gen C)
+   이고 checkpoint 가 셋 다 같다. 그 시점 comma `compile_modeld.py` 에서 이미지 입력이 `cat(road, wide)` 임을 확인 (Gen C 와 같은 순서).
+   `generation.py` 가 B 를 인식하고(state 집합은 명시 목록만 허용), 컴파일·런타임은 이미지 입력명만 메타데이터로 넘겨 같은 코드를 탄다.
+2. **pc_check 참조 비교.** 매 프레임의 raw 출력과 다음 프레임용 state 를, 같은 입력으로 ONNX 그래프를 직접 평가한 결과와 비교한다.
+3. **state 되먹임을 in-place → 버퍼 교환으로.** 2번이 잡아낸 문제. comma master 는 `next_state_*` 출력을 `state_*` 입력 버퍼에 겹쳐 쓴다.
+   모델 JIT 는 서로 다른 버퍼로 캡처되므로 이 방식은 커널 실행 순서에 기대는데, Gen B 에서는 깨졌다:
+
+   | 런타임 | OMH v1/v2 (Gen B) | Gen C 8종 |
+   |--------|-------------------|-----------|
+   | in-place (comma 방식) | 프레임 3부터 raw 출력 불일치 (max\|Δ\| 6.5~10.6, 이후 0.06~0.75 지속). state 자체는 일치 | 일치 |
+   | 버퍼 교환 | 일치 | 일치 |
+
+   교환 방식은 복사가 없고 순서 가정도 없다. `check_contracts.py genc-engine` 이 in-place 재도입을 막는다.
+
+**PC 검증 (Hermes VM, DEV=CPU:LLVM, 최종 코드, 모델당 12 프레임, 프레임 1 에 desire 펄스).**
+state-queue 카탈로그 모델 10종 전부 PASS, raw 출력·state 모두 ONNX 직접 평가와 **max\|Δ\| = 0**.
+OMH v1·v2·v3, Cheddar 는 두 카메라 해상도(1928x1208, 1344x760) 모두, 나머지는 번갈아 하나씩. 각 ONNX 는 서명 manifest 의 sha256 과 대조 후 사용.
+계약 14/14, pytest 69.
+
+**이 검증이 말해주지 않는 것.** QCOM 에서의 컴파일·구동과 속도, 메인 루프 실행, 주행. 참조 비교는 PC 백엔드 결과다 — 버퍼 교환은 커널 순서와
+무관하게 성립하도록 만든 것이지만 기기에서 확인한 것은 아니다. 기기에서도 같은 비교를 돌릴 수는 있다 (설치 후
+`pc_check.py --onnx /data/models/driving_supercombo.onnx --out /data/models --skip-compile --camera <w>x<h>`; 미시도, QCOM 에서의 허용 오차 미정).
+
+**남은 일 (위 "남은 일" 에 추가).**
+- 기기 테스트에 Gen B 하나(OMH v2) 포함.
+- 막아둔 7개는 엔진 작업이 아니라 결정 사항: deep 계열은 기기에서 하나(가장 가벼운 deepv5) 시험해 사유를 확인, Off policy v3·v5 는 차단 사유(주행 위험 판단)가 유효한지.
